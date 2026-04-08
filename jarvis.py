@@ -12,23 +12,32 @@ import threading
 import time
 import wave
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyautogui
 import pyttsx3
 import sounddevice as sd
 from rich.console import Console
-from rich.rule import Rule
 from rich.text import Text
 import numpy as np
 from faster_whisper import WhisperModel
 
 APP_NAME = "J.A.R.V.I.S."
-PROMPT = "J.A.R.V.I.S. > "
-WAKE_PHRASES = ("wake up", "jarvis")
+PROMPT = "J.A.R.V.I.S. > "  # legacy; interactive loop uses styled prompt + input()
+
+# Theme: orange + off-white only (no blues / browns / reds)
+T_ACCENT = "#FFB84D"  # labels, active HUD, prompt, banner
+T_TEXT = "#F5F0E8"    # body text
+T_MUTED = "#C9C0B4"   # timestamps, arrows, help, thinking, loading line
+T_INACTIVE = "#8A8278"  # inactive HUD chips (soft gray, still warm)
+T_RULE = "#D4A574"    # turn separator (muted orange-gold)
+T_ERR = "#E8A060"     # errors (amber-orange, not red)
+WAKE_PHRASES = ("wake up", "wake-up", "wakeup", "jarvis")
 ARM_SECONDS = 8
 VOICE_SESSION_SECONDS = 300  # keep voice active after wake
+# Direct jarvis.py (no --connect): mic stays in-session until "sleep" (no wake phrase required).
+_MIC_SESSION_ALWAYS_UNTIL_SLEEP = float("inf")
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
@@ -56,11 +65,13 @@ pyautogui.PAUSE = 0.03
 class AppState:
     armed_until: float = 0.0
     voice_session_until: float = 0.0
-    mic_device_index: int | None = None
-    mic_device_name: str = ""
     mic_level: float = 0.0
     last_error: str = ""
     tts_mode: str = "sapi"  # used only as fallback if a clip is missing
+    # Voice UI: timeline phases idle|armed|listening; stack overrides with processing|speaking
+    ui_phase_stack: list[str] = field(default_factory=list)
+    ui_phase_lock: threading.Lock = field(default_factory=threading.Lock)
+    _last_printed_hud_eff: str = field(default="", repr=False)
 
 
 def load_config() -> dict:
@@ -126,16 +137,130 @@ def is_garbage_llm_input(cmd: str) -> bool:
     return False
 
 
-def print_user_message(console: Console, text: str, *, via: str) -> None:
-    """via is 'microphone' or 'keyboard'."""
-    lbl = "microphone" if via == "microphone" else "keyboard"
-    console.print(Rule(style="dim"))
-    console.print(Text.assemble(("You ", "bold cyan"), (f"({lbl})", "cyan"), (" · ", "dim"), (text, "white")))
+def _chat_time() -> str:
+    return time.strftime("%H:%M")
+
+
+def print_chat_user(console: Console, text: str, *, via: str) -> None:
+    """Log a user turn: timestamp, YOU, ▶, message (no rule before)."""
+    _ = via  # reserved for future (e.g. mic icon)
+    ts = _chat_time()
+    line = Text()
+    line.append(f"{ts}  ", style=T_MUTED)
+    line.append("YOU", style=f"bold {T_ACCENT}")
+    line.append("  ▶  ", style=T_MUTED)
+    line.append(text, style=T_TEXT)
+    console.print(line)
+
+
+def strip_llm_stream_artifacts(text: str) -> str:
+    """Remove llama.cpp / model markers that leak into user-visible text."""
+    t = (text or "").strip()
+    if not t:
+        return t
+    t = re.sub(r"\[end of text\]", "", t, flags=re.IGNORECASE).strip()
+    t = re.sub(r"\s*\[end of text\]\s*$", "", t, flags=re.IGNORECASE).strip()
+    return t
+
+
+def _assistant_turn_separator(console: Console) -> None:
+    """One light line (Rich Rule can stack visually on Windows; long replies + typewriter felt like many bars)."""
+    try:
+        w = min(58, max(28, (console.size.width or 80) - 6))
+    except Exception:
+        w = 48
+    console.print(Text("─" * w, style=T_RULE))
 
 
 def print_assistant_message(console: Console, message: str) -> None:
-    console.print(Text.assemble(("Jarvis", "bold green"), (" · ", "dim"), (message, "white")))
-    console.print()
+    """Jarvis reply: timestamp, label, full body at once (typewriter desyncs from TTS on long answers)."""
+    message = strip_llm_stream_artifacts(message)
+    ts = _chat_time()
+    prefix = Text()
+    prefix.append(f"{ts}  ", style=T_MUTED)
+    prefix.append("J.A.R.V.I.S.", style=f"bold {T_ACCENT}")
+    prefix.append("  ▶  ", style=T_MUTED)
+    console.print(prefix, end="")
+    console.print(Text(message, style=T_TEXT))
+    _assistant_turn_separator(console)
+
+
+def print_assistant_thinking(console: Console) -> None:
+    """Shown while Pocket-TTS is generating; real reply prints after audio starts."""
+    ts = _chat_time()
+    line = Text()
+    line.append(f"{ts}  ", style=T_MUTED)
+    line.append("J.A.R.V.I.S.", style=f"bold {T_ACCENT}")
+    line.append("  ▶  ", style=T_MUTED)
+    line.append("Thinking…", style=T_MUTED)
+    console.print(line)
+
+
+def voice_timeline_phase(state: AppState) -> str:
+    now = time.time()
+    if now < state.voice_session_until:
+        return "listening"
+    if now < state.armed_until:
+        return "armed"
+    return "idle"
+
+
+def effective_voice_ui_phase(state: AppState) -> str:
+    with state.ui_phase_lock:
+        if state.ui_phase_stack:
+            return state.ui_phase_stack[-1]
+    return voice_timeline_phase(state)
+
+
+def push_voice_phase(state: AppState, console: Console | None, phase: str) -> None:
+    if not console:
+        return
+    with state.ui_phase_lock:
+        state.ui_phase_stack.append(phase)
+
+
+def pop_voice_phase(state: AppState, console: Console | None) -> None:
+    if not console:
+        return
+    with state.ui_phase_lock:
+        if state.ui_phase_stack:
+            state.ui_phase_stack.pop()
+
+
+def print_voice_status_line(console: Console, state: AppState, *, force: bool = False) -> None:
+    with state.ui_phase_lock:
+        override = state.ui_phase_stack[-1] if state.ui_phase_stack else None
+    base = voice_timeline_phase(state)
+    eff = override if override else base
+    if not force and eff == state._last_printed_hud_eff:
+        return
+    state._last_printed_hud_eff = eff
+
+    labels: tuple[tuple[str, str, str], ...] = (
+        ("● ", "ARMED", "armed"),
+        ("◉ ", "LISTENING", "listening"),
+        ("◎ ", "PROCESSING", "processing"),
+        ("▶ ", "SPEAKING", "speaking"),
+    )
+    line = Text()
+    for i, (sym, name, key) in enumerate(labels):
+        active = eff == key
+        if active:
+            line.append(sym + name, style=f"bold {T_ACCENT}")
+        else:
+            line.append(sym + name, style=T_INACTIVE)
+        if i + 1 < len(labels):
+            line.append("  ", style=T_INACTIVE)
+    if eff == "idle" and not override:
+        line.append("  ·  ", style=T_MUTED)
+        line.append('say “wake up” to arm', style=f"italic {T_MUTED}")
+    console.print(line)
+
+
+def print_prompt_block(console: Console, state: AppState) -> None:
+    """Status row anchored above the input line (orange HUD)."""
+    print_voice_status_line(console, state)
+    console.print(Text(PROMPT.strip() + " ", style=f"bold {T_ACCENT}"), end="")
 
 
 def is_qwen_gguf(path: Path) -> bool:
@@ -179,6 +304,7 @@ def sanitize_llm_reply(text: str) -> str:
     t = re.sub(r"(?i)^(Assistant|Jarvis)\s*:\s*", "", t).strip()
     # Drop fake multiturn on one line: "foo. User: bar"
     t = re.split(r"(?i)\sUser\s*:\s*", t, maxsplit=1)[0].strip()
+    t = strip_llm_stream_artifacts(t)
     max_chars = int(os.environ.get("JARVIS_LLM_MAX_REPLY_CHARS", "420"))
     if len(t) > max_chars:
         t = t[:max_chars].rsplit(" ", 1)[0] + "…"
@@ -195,69 +321,29 @@ def create_whisper_model() -> WhisperModel:
 
 
 def transcribe_audio_chunk(model: WhisperModel, chunk: np.ndarray) -> str:
-    segments, _info = model.transcribe(
-        chunk,
-        language="en",
-        task="transcribe",
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 250},
-        initial_prompt=_WHISPER_INITIAL_PROMPT,
+    use_vad = os.environ.get("JARVIS_WHISPER_VAD", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
     )
+    kw: dict = {
+        "language": "en",
+        "task": "transcribe",
+        "beam_size": 5,
+        "initial_prompt": _WHISPER_INITIAL_PROMPT,
+    }
+    if use_vad:
+        kw["vad_filter"] = True
+        kw["vad_parameters"] = {"min_silence_duration_ms": 250}
+    segments, _info = model.transcribe(chunk, **kw)
     return " ".join(s.text.strip() for s in segments).strip()
-
-
-def list_mics() -> list[tuple[int, str]]:
-    devices = sd.query_devices()
-    out: list[tuple[int, str]] = []
-    for i, d in enumerate(devices):
-        try:
-            if int(d.get("max_input_channels", 0)) > 0:
-                out.append((i, str(d.get("name", f"device-{i}"))))
-        except Exception:
-            continue
-    return out
-
-
-def pick_mic_interactive(console: Console, state: AppState) -> None:
-    mics = list_mics()
-    if not mics:
-        state.last_error = "No microphone devices detected."
-        return
-
-    console.print("[bold]Microphones[/bold]")
-    for i, name in mics:
-        console.print(f"  {i}: {name}")
-
-    console.print("\nPick a mic index (Enter for default).")
-    raw = input("> ").strip()
-    if not raw:
-        state.mic_device_index = None
-        state.mic_device_name = "(default)"
-        return
-
-    try:
-        idx = int(raw)
-    except ValueError:
-        state.last_error = "Invalid mic index; using default."
-        state.mic_device_index = None
-        state.mic_device_name = "(default)"
-        return
-
-    mic_dict = dict(mics)
-    if idx not in mic_dict:
-        state.last_error = "Mic index not found; using default."
-        state.mic_device_index = None
-        state.mic_device_name = "(default)"
-        return
-
-    state.mic_device_index = idx
-    state.mic_device_name = mic_dict[idx]
 
 
 class Speaker:
     def __init__(self, state: AppState):
         self.state = state
+        self.status_console: Console | None = None
         self._sapi = pyttsx3.init()
         self._sapi.setProperty("rate", 185)
 
@@ -328,7 +414,11 @@ class Speaker:
             try:
                 data, rate = self._load_wav_int16(wav)
                 if blocking:
-                    self._play_pcm_int16(data, rate)
+                    push_voice_phase(self.state, self.status_console, "speaking")
+                    try:
+                        self._play_pcm_int16(data, rate)
+                    finally:
+                        pop_voice_phase(self.state, self.status_console)
                 else:
                     self._play_pcm_int16_async(data, rate)
                 return
@@ -337,13 +427,17 @@ class Speaker:
                 break
 
         if fallback_text:
-            self.say(fallback_text)
+            # Avoid pocket-tts + assistant transcript during voice keys (flickers console while input() waits).
+            if blocking:
+                self._say_sapi(fallback_text)
+            else:
+                threading.Thread(target=self._say_sapi, args=(fallback_text,), daemon=True).start()
 
     def say(self, text: str) -> None:
         text = (text or "").strip()
         if not text:
             return
-        speak_with_pocket_tts(text, voice_path=str(VOICE_TEMPLATE), speaker=self)
+        speak_with_pocket_tts(text, voice_path=str(VOICE_TEMPLATE), speaker=self, console=self.status_console)
 
     def _say_sapi(self, text: str) -> None:
         self._sapi.say(text)
@@ -374,7 +468,7 @@ def orange_banner() -> Text:
     banner_path = ROOT / "jarvis.txt"
     txt = banner_path.read_text(encoding="utf-8", errors="replace").rstrip("\n") if banner_path.exists() else "JARVIS"
     t = Text(txt)
-    t.stylize("bold #ff8c00")  # orange
+    t.stylize(f"bold {T_ACCENT}")
     return t
 
 
@@ -391,8 +485,8 @@ def configure_windows_utf8() -> None:
     except Exception:
         pass
     try:
-        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
     except Exception:
         pass
 
@@ -405,11 +499,18 @@ def normalize_text(s: str) -> str:
 
 def contains_wake_phrase(s: str) -> bool:
     s_norm = normalize_text(s)
-    return any(p in s_norm for p in WAKE_PHRASES)
+    s_norm = s_norm.replace("-", " ")
+    s_norm = re.sub(r"\s+", " ", s_norm).strip()
+    if any(p in s_norm for p in WAKE_PHRASES):
+        return True
+    compact = re.sub(r"\s+", "", s_norm)
+    return "wakeup" in compact
 
 
 def strip_wake_phrase(s: str) -> str:
     s_norm = normalize_text(s)
+    s_norm = s_norm.replace("-", " ")
+    s_norm = re.sub(r"\s+", " ", s_norm).strip()
     for phrase in WAKE_PHRASES:
         if s_norm.startswith(phrase):
             return s_norm[len(phrase) :].strip(" ,:-")
@@ -523,11 +624,13 @@ def _llama_postprocess_stdout(out: str) -> str:
             continue
         if s.startswith(("load_", "main:", "llama_", "common_", "print_info:", "system_info:", "sampler", "generate:")):
             continue
+        if re.fullmatch(r"\[end of text\]", s, flags=re.I):
+            continue
         lines.append(s)
     text = " ".join(lines).strip()
     if " Q:" in text:
         text = text.split(" Q:", 1)[0].strip()
-    return text
+    return strip_llm_stream_artifacts(text)
 
 
 def run_llama_prompt(
@@ -612,6 +715,14 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
     if not cmd:
         return
 
+    push_voice_phase(state, console, "processing")
+    try:
+        _handle_command_body(state, speaker, cmd, console)
+    finally:
+        pop_voice_phase(state, console)
+
+
+def _handle_command_body(state: AppState, speaker: Speaker, cmd: str, console: Console) -> None:
     m = re.match(r"^(ask|chat)\s+(.+)$", cmd)
     if m:
         question = m.group(2).strip()
@@ -624,6 +735,7 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
 
     if cmd in {"sleep", "go to sleep", "stand by", "stop listening"}:
         state.voice_session_until = 0.0
+        state.armed_until = 0.0
         speaker.speak_key("listening_off", "Standing by.")
         return
 
@@ -635,32 +747,11 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
         console.clear()
         console.print(orange_banner())
         console.print()
+        print_voice_status_line(console, state, force=True)
         return
 
     if cmd in {"test sound", "test audio"}:
         speaker.speak_key("boot", "Systems online. Welcome, sir.")
-        return
-
-    if cmd in {"list mics", "list microphones"}:
-        mics = list_mics()
-        console.print("[bold]Microphones[/bold]")
-        for i, name in mics:
-            console.print(f"  {i}: {name}")
-        return
-
-    m = re.match(r"^(use mic|set mic)\s+(\d+)$", cmd)
-    if m:
-        idx = int(m.group(2))
-        mic_dict = dict(list_mics())
-        if idx not in mic_dict:
-            speaker.speak_key("error", "That microphone index does not exist.")
-            return
-        state.mic_device_index = idx
-        state.mic_device_name = mic_dict[idx]
-        cfg = load_config()
-        cfg["mic_device_index"] = idx
-        save_config(cfg)
-        speaker.speak_key("ok", "Microphone updated. Restart Jarvis.")
         return
 
     m = re.match(r"^(open)\s+(.+)$", cmd)
@@ -715,9 +806,23 @@ def handle_natural_language(state: AppState, speaker: Speaker, console: Console,
     if reply.startswith("LLM error:") or "not installed" in reply.lower():
         speaker.speak_key("didnt_understand", "Sorry, I did not understand that.")
         if reply:
-            console.print(Text(reply, style="dim"))
+            console.print(Text(reply, style=T_MUTED))
         return
     speak_with_pocket_tts(reply, voice_path=str(VOICE_TEMPLATE), speaker=speaker, console=console)
+
+
+def _prune_ephemeral_pocket_cache(cache_dir: Path) -> None:
+    """Remove prior on-the-spot Pocket-TTS outputs; keep only fixed names like warmup."""
+    keep = frozenset({"_jarvis_pocket_warmup.wav"})
+    try:
+        for p in cache_dir.glob("pocket_*_*.wav"):
+            if p.is_file() and p.name not in keep:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def _pocket_tts_generate_wav(text_chunk: str, vpath: Path, out_path: Path) -> bool:
@@ -759,10 +864,27 @@ def speak_with_pocket_tts(
     Voice-clone via Pocket-TTS. Starts audio generation in a background thread, then (when console
     is passed) prints the assistant line so text appears while the first clip renders.
     """
-    text = (text or "").strip()
+    text = strip_llm_stream_artifacts((text or "").strip())
     if not text:
         return
 
+    c = console if console is not None else speaker.status_console
+    if c:
+        push_voice_phase(speaker.state, c, "speaking")
+    try:
+        _speak_with_pocket_tts_impl(text, voice_path, speaker, console=c)
+    finally:
+        if c:
+            pop_voice_phase(speaker.state, c)
+
+
+def _speak_with_pocket_tts_impl(
+    text: str,
+    voice_path: str,
+    speaker: Speaker,
+    *,
+    console: Console | None,
+) -> None:
     vpath = Path(voice_path)
     if not vpath.is_file():
         if console:
@@ -775,9 +897,12 @@ def speak_with_pocket_tts(
     try:
         cache_dir = ROOT / ".cache"
         cache_dir.mkdir(exist_ok=True)
+        _prune_ephemeral_pocket_cache(cache_dir)
         chunks = _split_tts_chunks(text, max_len=chunk_max)
         if not chunks:
             return
+
+        delay = float(os.environ.get("JARVIS_TTS_TEXT_DELAY_SEC", "1"))
 
         if len(chunks) == 1:
             out_path = cache_dir / f"pocket_one_{time.time_ns() & 0xFFFFFFFF}.wav"
@@ -790,11 +915,18 @@ def speak_with_pocket_tts(
 
             threading.Thread(target=gen_one, daemon=True).start()
             if console:
-                print_assistant_message(console, text)
+                print_assistant_thinking(console)
             done.wait(timeout=180)
             if ok_box[0] and out_path.is_file():
-                speaker._play_wav(out_path)
+                th = threading.Thread(target=lambda: speaker._play_wav(out_path), daemon=True)
+                th.start()
+                time.sleep(delay)
+                if console:
+                    print_assistant_message(console, text)
+                th.join(timeout=600)
             else:
+                if console:
+                    print_assistant_message(console, text)
                 speaker._say_sapi(text)
             return
 
@@ -809,17 +941,31 @@ def speak_with_pocket_tts(
                     q.put((i, None))
                     return
 
+        if console:
+            print_assistant_thinking(console)
         threading.Thread(target=producer, daemon=True).start()
+        _idx0, path0 = q.get()
+        if path0 is None:
+            if console:
+                print_assistant_message(console, text)
+            speaker._say_sapi(text)
+            return
+
+        def play_sequential() -> None:
+            speaker._play_wav(path0)
+            for expect_i in range(1, len(chunks)):
+                _i2, p2 = q.get()
+                if p2 is None:
+                    speaker._say_sapi(" ".join(chunks[expect_i:]).strip() or text)
+                    return
+                speaker._play_wav(p2)
+
+        th = threading.Thread(target=play_sequential, daemon=True)
+        th.start()
+        time.sleep(delay)
         if console:
             print_assistant_message(console, text)
-
-        for expect_i in range(len(chunks)):
-            _idx, path = q.get()
-            if path is None:
-                speaker._say_sapi(" ".join(chunks[expect_i:]).strip() or text)
-                return
-            speaker._play_wav(path)
-
+        th.join(timeout=600)
         return
     except Exception:
         pass
@@ -829,7 +975,12 @@ def speak_with_pocket_tts(
     speaker._say_sapi(text)
 
 
-def speech_worker(text_q: "queue.Queue[str]", stop_evt: threading.Event, state: AppState) -> None:
+def speech_worker(
+    text_q: "queue.Queue[str]",
+    stop_evt: threading.Event,
+    state: AppState,
+    console: Console | None = None,
+) -> None:
     whisper = create_whisper_model()
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
@@ -856,7 +1007,7 @@ def speech_worker(text_q: "queue.Queue[str]", stop_evt: threading.Event, state: 
         dtype="float32",
         channels=1,
         callback=callback,
-        device=state.mic_device_index,
+        device=None,
     ):
         while not stop_evt.is_set():
             try:
@@ -886,7 +1037,12 @@ def ensure_whisper_warm(console: Console) -> None:
     """
     wmodel = resolved_whisper_model_name()
     wdev, _ = whisper_device_options()
-    console.print(f"[dim]Loading speech model {wmodel!r} ({wdev}) — first run may download…[/dim]")
+    console.print(
+        Text(
+            f"Loading speech model {wmodel!r} ({wdev}) — first run may download…",
+            style=T_MUTED,
+        )
+    )
     _ = create_whisper_model()
 
 
@@ -909,31 +1065,25 @@ def socket_reader_loop(sock: socket.socket, out_q: "queue.Queue[str]", stop_evt:
 
 def run_ui(connect: tuple[str, int] | None) -> None:
     configure_windows_utf8()
-    console = Console()
+    # LLM output can contain "["; disable markup parsing. legacy_windows=False prefers UTF-8 VT output on Win10+.
+    console = Console(markup=False, highlight=False, legacy_windows=False)
     console.clear()
     console.print(orange_banner())
-    console.print(Text("    -----  J.A.R.V.I.S.  -----", style="bold white"))
-    console.print(Text("Just A Rather Very Intelligent System", style="dim"))
+    console.print(Text("    -----  J.A.R.V.I.S.  -----", style=f"bold {T_ACCENT}"))
+    console.print(Text("Just A Rather Very Intelligent System", style=T_MUTED))
     console.print()
 
     state = AppState()
-    cfg = load_config()
-    state.mic_device_index = cfg.get("mic_device_index", None)
-    if state.mic_device_index is not None:
-        try:
-            state.mic_device_name = sd.query_devices(state.mic_device_index).get("name", "")
-        except Exception:
-            state.mic_device_name = ""
-
-    if connect is None and state.mic_device_index is None:
-        pick_mic_interactive(console, state)
-        cfg["mic_device_index"] = state.mic_device_index
-        save_config(cfg)
+    if connect is None:
+        # Terminal is already "live": accept voice commands without a wake phrase until sleep.
+        state.voice_session_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
+        state.armed_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
 
     if connect is None:
         ensure_whisper_warm(console)
 
     speaker = Speaker(state)
+    speaker.status_console = console
 
     def pocket_tts_warmup_background() -> None:
         if not VOICE_TEMPLATE.is_file():
@@ -974,22 +1124,41 @@ def run_ui(connect: tuple[str, int] | None) -> None:
     pocket_tts_warmup_background()
 
     # Print immediately, play greeting async for seamless feel.
-    console.print(Text("Welcome, Sir.", style="bold white"))
-    console.print(Text("How may I assist you today?", style="bold white"))
-    speaker.speak_key("wake", "Welcome, sir. How may I assist you today?", blocking=False)
+    console.print(Text("Welcome, Sir.", style=f"bold {T_ACCENT}"))
+    console.print(Text("How may I assist you today?", style=T_TEXT))
+    if connect is None:
+        # Startup: only voices/wake.wav (no default SAPI — wrong voice / odd phrases). Opt-in: JARVIS_WAKE_SAPI=1.
+        if (VOICE_DIR / "wake.wav").is_file():
+            speaker.speak_key("wake", "", blocking=False)
+        elif os.environ.get("JARVIS_WAKE_SAPI", "").strip().lower() in ("1", "true", "yes"):
+            threading.Thread(
+                target=speaker._say_sapi,
+                args=("Welcome, sir. How may I assist you today.",),
+                daemon=True,
+            ).start()
     console.print()
-    console.print(Text("I can open websites, apps, type text, and answer questions via the local LLM.", style="dim"))
-    console.print(Text("Say things like “launch notepad”, “google …”, or ask anything after wake.", style="dim"))
-    console.print(Text("Commands: clear, exit, list mics, use mic <n>, test sound", style="dim"))
-    if connect is not None:
-        console.print(Text("Speech: connected (wake up to arm)", style="dim"))
+    console.print(
+        Text(
+            "I can open websites, apps, type text, and answer questions via the local LLM.",
+            style=T_MUTED,
+        )
+    )
+    console.print(
+        Text(
+            "Say things like “launch notepad”, “google …”, or ask anything after wake.",
+            style=T_MUTED,
+        )
+    )
+    console.print(Text("Commands: clear, exit, test sound, sleep", style=T_MUTED))
     console.print()
 
     stop_evt = threading.Event()
     speech_q: "queue.Queue[str]" = queue.Queue()
 
     if connect is None:
-        speech_thread = threading.Thread(target=speech_worker, args=(speech_q, stop_evt, state), daemon=True)
+        speech_thread = threading.Thread(
+            target=speech_worker, args=(speech_q, stop_evt, state, console), daemon=True
+        )
         speech_thread.start()
     else:
         host, port = connect
@@ -1002,14 +1171,17 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             now = time.time()
             state.armed_until = now + ARM_SECONDS
             state.voice_session_until = now + VOICE_SESSION_SECONDS
+            # Daemon consumed the wake phrase before we connected; acknowledge with audio.
+            speaker.speak_key("confirm", "Yes, sir?", blocking=False)
         except Exception as e:
-            console.print(Text(f"[error] Failed to connect to daemon: {e}", style="red"))
-            console.print(Text("Starting local microphone mode instead.", style="dim"))
+            console.print(Text(f"[error] Failed to connect to daemon: {e}", style=T_ERR))
+            console.print(Text("Starting local microphone mode instead.", style=T_MUTED))
             connect = None
             ensure_whisper_warm(console)
-            speech_thread = threading.Thread(target=speech_worker, args=(speech_q, stop_evt, state), daemon=True)
+            speech_thread = threading.Thread(
+                target=speech_worker, args=(speech_q, stop_evt, state, console), daemon=True
+            )
             speech_thread.start()
-
     def speech_loop():
         pending: list[str] = []
         pending_started_at = 0.0
@@ -1038,8 +1210,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             return s
 
         def log_voice_turn(phrase: str) -> None:
-            console.print()
-            print_user_message(console, phrase, via="microphone")
+            print_chat_user(console, phrase, via="microphone")
 
         while not stop_evt.is_set():
             try:
@@ -1077,10 +1248,11 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                             state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
                         except SystemExit:
                             stop_evt.set()
-                            return
+                            # Main thread may be blocked on input(); end the whole process.
+                            os._exit(0)
                         except Exception as e:
                             state.last_error = str(e)
-                            console.print(Text(f"[error] {e}", style="red"))
+                            console.print(Text(f"[error] {e}", style=T_ERR))
                 continue
 
             now = time.time()
@@ -1102,7 +1274,6 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             if not phrase:
                 continue
 
-            phrase = flush_pending()
             phrase_norm = normalize_phrase(phrase)
             if phrase_norm == last_final and (now - last_final_at) < 1.2:
                 continue
@@ -1131,10 +1302,10 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                 state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
             except SystemExit:
                 stop_evt.set()
-                return
+                os._exit(0)
             except Exception as e:
                 state.last_error = str(e)
-                console.print(Text(f"[error] {e}", style="red"))
+                console.print(Text(f"[error] {e}", style=T_ERR))
 
     bg = threading.Thread(target=speech_loop, daemon=True)
     bg.start()
@@ -1142,16 +1313,18 @@ def run_ui(connect: tuple[str, int] | None) -> None:
     try:
         while True:
             try:
-                cmd = input(PROMPT)
+                print_prompt_block(console, state)
+                cmd = input()
             except (EOFError, KeyboardInterrupt):
                 raise SystemExit(0)
             cmd_stripped = (cmd or "").strip()
             if cmd_stripped:
+                # Typed text already appeared on the J.A.R.V.I.S. > line; skip duplicate YOU log.
                 console.print()
-                print_user_message(console, cmd_stripped, via="keyboard")
             handle_command(state, speaker, cmd, console)
     except SystemExit:
         stop_evt.set()
+        sys.exit(0)
 
 
 def main() -> None:

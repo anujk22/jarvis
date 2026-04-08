@@ -6,3 +6,7 @@ config/
 models/vosk/
 models/piper/
 jarvis/
+
+# Large artifacts — install via scripts/setup_llm.ps1 (CI clones without these)
+models/llm/*.gguf
+bin/llama/
