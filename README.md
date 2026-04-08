@@ -28,17 +28,6 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-2. (Optional) If `jarvis/en/en_GB/jarvis/high/` is missing
-The repo includes a tiny downloader that writes files into whatever `--out` path you give it.
-
-Example (downloads “high” model into the expected folder structure):
-```powershell
-python .\scripts\download_voice.py --repo jgkawell/jarvis --filename en/en_GB/jarvis/high/jarvis-high.onnx --out jarvis\en\en_GB\jarvis\high\jarvis-high.onnx
-python .\scripts\download_voice.py --repo jgkawell/jarvis --filename en/en_GB/jarvis/high/jarvis-high.onnx.json --out jarvis\en\en_GB\jarvis\high\jarvis-high.onnx.json
-```
-
-Model source: `https://huggingface.co/jgkawell/jarvis`
-
 ## Run
 
 ### Normal mode (terminal appears immediately)
@@ -74,6 +63,21 @@ Note: the silent daemon uses the saved mic index from `jarvis_config.json`. If t
 - `use mic <n>` (re-select mic index; restart recommended)
 - `clear`
 - `exit`
+
+## Voice clips (prerecorded)
+
+Jarvis prefers prerecorded WAV files in `./voices/`.
+If a clip for a given “key” exists, Jarvis plays it; otherwise it falls back to TTS.
+
+Common keys:
+- `wake.wav` (greeting on startup / wake)
+- `boot.wav` (`test sound`)
+- `confirm.wav` (“Yes, sir?”)
+- `opening.wav` (opening websites/apps)
+- `searching.wav` (searching)
+- `done.wav` (done / navigation)
+- `didnt_udnerstand.wav` (unknown command; key alias: `didnt_understand`)
+- `goodbye.wav` (exit)
 
 ## Troubleshooting (no sound)
 

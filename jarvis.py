@@ -19,11 +19,13 @@ import sounddevice as sd
 from rich.console import Console
 from rich.text import Text
 from vosk import KaldiRecognizer, Model
+import numpy as np
 
 APP_NAME = "J.A.R.V.I.S."
 PROMPT = "J.A.R.V.I.S. > "
 WAKE_PHRASES = ("wake up", "jarvis")
 ARM_SECONDS = 8
+VOICE_SESSION_SECONDS = 300  # keep voice active after wake
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
@@ -33,6 +35,7 @@ DEFAULT_PIPER_MODEL = ROOT / "models" / "piper" / "jarvis-medium.onnx"
 DEFAULT_PIPER_MODEL_CONFIG = ROOT / "models" / "piper" / "jarvis-medium.onnx.json"
 
 VOSK_MODEL_DIR = ROOT / "models" / "vosk" / "model"
+VOICE_DIR = ROOT / "voices"
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.03
@@ -41,6 +44,7 @@ pyautogui.PAUSE = 0.03
 @dataclass
 class AppState:
     armed_until: float = 0.0
+    voice_session_until: float = 0.0
     mic_device_index: int | None = None
     mic_device_name: str = ""
     mic_level: float = 0.0
@@ -127,6 +131,76 @@ class Speaker:
             except Exception:
                 self._piper_voice = None
 
+        self._audio_lock = threading.Lock()
+        self._audio_stream: sd.OutputStream | None = None
+        self._audio_rate = 24000  # common for many voice samples
+        self._audio_channels = 1
+
+    def _ensure_audio_stream(self, samplerate: int, channels: int) -> sd.OutputStream:
+        # Keep one warm output stream to avoid "first play" lag.
+        if self._audio_stream is None or self._audio_rate != samplerate or self._audio_channels != channels:
+            if self._audio_stream is not None:
+                try:
+                    self._audio_stream.stop()
+                    self._audio_stream.close()
+                except Exception:
+                    pass
+            self._audio_rate = samplerate
+            self._audio_channels = channels
+            self._audio_stream = sd.OutputStream(
+                samplerate=self._audio_rate,
+                channels=self._audio_channels,
+                dtype="int16",
+                blocksize=0,
+            )
+            self._audio_stream.start()
+
+            # Warmup: write a tiny bit of silence so the first real clip has no lag.
+            silence = np.zeros((int(self._audio_rate * 0.03), self._audio_channels), dtype=np.int16)
+            self._audio_stream.write(silence)
+        return self._audio_stream
+
+    def _play_pcm_int16(self, data: np.ndarray, samplerate: int) -> None:
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        with self._audio_lock:
+            stream = self._ensure_audio_stream(samplerate=samplerate, channels=int(data.shape[1]))
+            stream.write(data.astype(np.int16, copy=False))
+
+    def _play_pcm_int16_async(self, data: np.ndarray, samplerate: int) -> None:
+        t = threading.Thread(target=self._play_pcm_int16, args=(data, samplerate), daemon=True)
+        t.start()
+
+    def speak_key(self, key: str, fallback_text: str = "", *, blocking: bool = True) -> None:
+        """
+        Prefer prerecorded voice pack clips from ./voices/<key>.wav.
+        If missing (or playback fails), optionally fall back to TTS/SAPI.
+        """
+        # Support small spelling variations for existing filenames.
+        aliases = {
+            "didnt_understand": "didnt_udnerstand",
+            "didnt_understood": "didnt_udnerstand",
+            "confirm_yes": "confirm",
+            "yes_sir": "confirm",
+        }
+        key = aliases.get(key, key)
+
+        wav = VOICE_DIR / f"{key}.wav"
+        if wav.exists():
+            try:
+                data, rate = self._load_wav_int16(wav)
+                if blocking:
+                    self._play_pcm_int16(data, rate)
+                else:
+                    self._play_pcm_int16_async(data, rate)
+                return
+            except Exception:
+                # If playback fails, fall back to text-to-speech.
+                pass
+
+        if fallback_text:
+            self.say(fallback_text)
+
     def say(self, text: str) -> None:
         text = (text or "").strip()
         if not text:
@@ -139,6 +213,26 @@ class Speaker:
     def _say_sapi(self, text: str) -> None:
         self._sapi.say(text)
         self._sapi.runAndWait()
+
+    def _play_wav(self, path: Path) -> None:
+        """Play a WAV file synchronously using the warmed stream."""
+        data, rate = self._load_wav_int16(path)
+        self._play_pcm_int16(data, rate)
+
+    def _load_wav_int16(self, path: Path) -> tuple[np.ndarray, int]:
+        with wave.open(str(path), "rb") as wf:
+            channels = wf.getnchannels()
+            rate = wf.getframerate()
+            width = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+
+        if width != 2:
+            raise RuntimeError("Only 16-bit PCM wav is supported.")
+
+        data = np.frombuffer(frames, dtype="<i2")
+        if channels > 1:
+            data = data.reshape(-1, channels)
+        return data, rate
 
     def _say_piper(self, text: str) -> None:
         tmp = ROOT / ".cache"
@@ -154,22 +248,7 @@ class Speaker:
                 wf.setframerate(int(self._piper_voice.config.sample_rate))
                 for chunk in self._piper_voice.synthesize(text):
                     wf.writeframes(chunk.audio_int16_bytes)
-            try:
-                winsound.PlaySound(str(out_wav), winsound.SND_FILENAME | winsound.SND_SYNC)
-            except Exception:
-                # Fallback: PowerShell SoundPlayer
-                import subprocess
-
-                subprocess.run(
-                    [
-                        "powershell",
-                        "-NoProfile",
-                        "-Command",
-                        f"(New-Object Media.SoundPlayer '{out_wav}').PlaySync();",
-                    ],
-                    check=False,
-                    capture_output=True,
-                )
+            self._play_wav(out_wav)
         except Exception as e:
             self.state.tts_mode = "sapi"
             self.state.last_error = f"Piper failed; falling back to SAPI: {e}"
@@ -262,8 +341,13 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
     if not cmd:
         return
 
+    if cmd in {"sleep", "go to sleep", "stand by", "stop listening"}:
+        state.voice_session_until = 0.0
+        speaker.speak_key("listening_off", "Standing by.")
+        return
+
     if cmd in {"exit", "quit"}:
-        speaker.say("Goodbye, sir.")
+        speaker.speak_key("goodbye", "Goodbye, sir.")
         raise SystemExit(0)
 
     if cmd in {"clear", "cls"}:
@@ -273,7 +357,7 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
         return
 
     if cmd in {"test sound", "test audio"}:
-        speaker.say("Welcome, sir. How may I assist you today?")
+        speaker.speak_key("boot", "Systems online. Welcome, sir.")
         return
 
     if cmd in {"list mics", "list microphones"}:
@@ -288,14 +372,14 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
         idx = int(m.group(2))
         mic_dict = dict(list_mics())
         if idx not in mic_dict:
-            speaker.say("That microphone index does not exist.")
+            speaker.speak_key("error", "That microphone index does not exist.")
             return
         state.mic_device_index = idx
         state.mic_device_name = mic_dict[idx]
         cfg = load_config()
         cfg["mic_device_index"] = idx
         save_config(cfg)
-        speaker.say("Microphone updated. Restart Jarvis.")
+        speaker.speak_key("ok", "Microphone updated. Restart Jarvis.")
         return
 
     m = re.match(r"^(open)\s+(.+)$", cmd)
@@ -309,35 +393,35 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
         }
         if target in quick_sites:
             open_url(quick_sites[target])
-            speaker.say(f"Opening {target}.")
+            speaker.speak_key("opening", f"Opening {target}.")
             return
         if re.search(r"\.|https?://", target):
             open_url(target)
-            speaker.say("Opening it.")
+            speaker.speak_key("opening", "Opening it.")
             return
         open_app(target)
-        speaker.say(f"Opening {target}.")
+        speaker.speak_key("opening", f"Opening {target}.")
         return
 
     m = re.match(r"^(go to|navigate to)\s+(.+)$", cmd)
     if m:
         open_url(m.group(2).strip())
-        speaker.say("Done.")
+        speaker.speak_key("done", "Done.")
         return
 
     m = re.match(r"^(search for)\s+(.+)$", cmd)
     if m:
         open_search(m.group(2).strip())
-        speaker.say("Searching.")
+        speaker.speak_key("searching", "Searching.")
         return
 
     m = re.match(r"^(type)\s+(.+)$", cmd)
     if m:
         type_text(m.group(2))
-        speaker.say("Done.")
+        speaker.speak_key("done", "Done.")
         return
 
-    speaker.say("Sorry, I did not understand that.")
+    speaker.speak_key("didnt_understand", "Sorry, I did not understand that.")
 
 
 def speech_worker(text_q: "queue.Queue[str]", stop_evt: threading.Event, state: AppState) -> None:
@@ -494,9 +578,10 @@ def run_ui(connect: tuple[str, int] | None) -> None:
         ensure_vosk_model_auto(console)
 
     speaker = Speaker(state)
-    speaker.say("Welcome, sir. How may I assist you today?")
+    # Print immediately, play greeting async for seamless feel.
     console.print(Text("Welcome, Sir.", style="bold white"))
     console.print(Text("How may I assist you today?", style="bold white"))
+    speaker.speak_key("wake", "Welcome, sir. How may I assist you today?", blocking=False)
     console.print()
     console.print(Text("I can open websites, apps, and type text.", style="dim"))
     console.print(Text("Commands: clear, exit, list mics, use mic <n>, test sound", style="dim"))
@@ -516,6 +601,11 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             s = socket.create_connection((host, port), timeout=10)
             t = threading.Thread(target=socket_reader_loop, args=(s, speech_q, stop_evt), daemon=True)
             t.start()
+            # If we were launched by the daemon on a "wake up" phrase, the wake phrase
+            # may have occurred before this UI connected. Auto-arm on connect.
+            now = time.time()
+            state.armed_until = now + ARM_SECONDS
+            state.voice_session_until = now + VOICE_SESSION_SECONDS
         except Exception as e:
             console.print(Text(f"[error] Failed to connect to daemon: {e}", style="red"))
             console.print(Text("Starting local microphone mode instead.", style="dim"))
@@ -533,12 +623,14 @@ def run_ui(connect: tuple[str, int] | None) -> None:
 
             now = time.time()
             woke = contains_wake_phrase(heard)
-            armed = now < state.armed_until
+            in_session = now < state.voice_session_until
+            armed = (now < state.armed_until) or in_session
             if woke:
                 state.armed_until = now + ARM_SECONDS
+                state.voice_session_until = now + VOICE_SESSION_SECONDS
                 cmd = strip_wake_phrase(heard)
                 if not cmd:
-                    speaker.say("Yes, sir?")
+                    speaker.speak_key("confirm", "Yes, sir?")
                     continue
             elif not armed:
                 continue
@@ -548,6 +640,8 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             console.print(Text(f"[heard] {heard}", style="dim"))
             try:
                 handle_command(state, speaker, cmd, console)
+                # successful command keeps the voice session alive
+                state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
             except SystemExit:
                 stop_evt.set()
                 return
