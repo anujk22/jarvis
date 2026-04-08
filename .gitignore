@@ -2,5 +2,5 @@
 .cache/
 __pycache__/
 *.pyc
-jarvis_config.json
+config/
 models/vosk/

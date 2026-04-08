@@ -26,7 +26,8 @@ WAKE_PHRASES = ("wake up", "jarvis")
 ARM_SECONDS = 8
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "jarvis_config.json"
+CONFIG_DIR = ROOT / "config"
+CONFIG_PATH = CONFIG_DIR / "jarvis_config.json"
 
 DEFAULT_PIPER_MODEL = ROOT / "models" / "piper" / "jarvis-medium.onnx"
 DEFAULT_PIPER_MODEL_CONFIG = ROOT / "models" / "piper" / "jarvis-medium.onnx.json"
@@ -57,6 +58,7 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
@@ -576,6 +578,12 @@ def main() -> None:
     if args.connect:
         host, port_s = args.connect.split(":", 1)
         connect = (host, int(port_s))
+
+    # Migrate old root-level config if present
+    old_cfg = ROOT / "jarvis_config.json"
+    if old_cfg.exists() and not CONFIG_PATH.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        old_cfg.replace(CONFIG_PATH)
 
     run_ui(connect)
 

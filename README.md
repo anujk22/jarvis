@@ -7,13 +7,13 @@ Local, lightweight “Jarvis”-style assistant that:
 - Executes simple desktop actions (open sites/apps, type text)
 - Prints recognized speech to the terminal once you say the wake phrase
 
-## Where the models live
+## Layout
 
-- Voice model (Piper): `./jarvis/en/en_GB/jarvis/high/` (or `./jarvis/.../medium/`)
+- Voice model (Piper): `jarvis/en/en_GB/jarvis/high/` (or `jarvis/.../medium/`)
   - Jarvis will prefer `jarvis-high.onnx` if present, otherwise `jarvis-medium.onnx`
-- Speech-to-text (Vosk): `./models/vosk/model`
+- Speech-to-text (Vosk): `models/vosk/model`
   - Automatically downloaded on first run
-- Config: `./jarvis_config.json`
+- Config: `config/jarvis_config.json`
   - Stores which mic index you selected
 
 If you already have the `jarvis/` folder, you are good.
