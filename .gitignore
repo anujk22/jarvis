@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 config/
 models/vosk/
+models/piper/
+jarvis/

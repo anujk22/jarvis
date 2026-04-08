@@ -1,26 +1,15 @@
 # Jarvis (Windows voice assistant)
 
-Local, lightweight “Jarvis”-style assistant that:
-
+Local, lightweight desktop assistant that:
 - Listens to your microphone (offline speech-to-text via Vosk)
-- Uses your voice model (Piper in Python) for speech output
-- Executes simple desktop actions (open sites/apps, type text)
-- Prints recognized speech to the terminal once you say the wake phrase
+- Runs simple Windows desktop tasks (open a browser URL, open apps, type text)
+- Shows a Jarvis-like terminal greeting and prompt
+- Speaks back using **either** Windows SAPI (default) **or** an optional local Piper voice model
 
-## Layout
 
-- Voice model (Piper): `jarvis/en/en_GB/jarvis/high/` (or `jarvis/.../medium/`)
-  - Jarvis will prefer `jarvis-high.onnx` if present, otherwise `jarvis-medium.onnx`
-- Speech-to-text (Vosk): `models/vosk/model`
-  - Automatically downloaded on first run
-- Config: `config/jarvis_config.json`
-  - Stores which mic index you selected
+## Setup (Windows)
 
-If you already have the `jarvis/` folder, you are good.
-
-## Setup (one time)
-
-1. Create venv + install dependencies
+### 1) Create venv + install deps
 ```powershell
 cd d:\Coding\Cursor\Jarvis
 python -m venv .venv
@@ -28,61 +17,33 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Run
+### 2) (Optional) Download the Jarvis-style Piper voice
+This project supports running Piper **directly in Python** (via `piper-tts`) and downloading the
+Hugging Face voice model into `models\piper\`.
 
-### Normal mode (terminal appears immediately)
+Run:
 ```powershell
-cd d:\Coding\Cursor\Jarvis
-.\.venv\Scripts\python.exe .\jarvis.py
+python .\scripts\download_voice.py --repo jgkawell/jarvis --filename en/en_GB/jarvis/medium/jarvis-medium.onnx --out models\piper\jarvis-medium.onnx
+python .\scripts\download_voice.py --repo jgkawell/jarvis --filename en/en_GB/jarvis/medium/jarvis-medium.onnx.json --out models\piper\jarvis-medium.onnx.json
 ```
 
-### “Perfect world” mode (silent until wake up)
+Model source: `https://huggingface.co/jgkawell/jarvis`
+
+### 3) Run
 ```powershell
-cd d:\Coding\Cursor\Jarvis
-.\.venv\Scripts\pythonw.exe .\jarvis_daemon.py
+python .\jarvis.py
 ```
 
-Note: the silent daemon uses the saved mic index from `jarvis_config.json`. If the wrong mic is selected, run normal mode once, then use `use mic <n>`.
-
-## Usage
-
-1. Say **“wake up”** (or “jarvis”) to arm Jarvis for ~8 seconds.
-2. Then say a command, for example:
-
+## Voice commands (examples)
+- Say “wake up” then:
   - “open youtube”
   - “go to https://news.ycombinator.com”
-  - “search for pizza”
+  - “search for best lightweight speech recognition”
   - “open notepad”
   - “type hello world”
   - “exit”
 
-### Commands (typed or voice)
-
-- `test sound` (spoken check)
-- `list mics`
-- `use mic <n>` (re-select mic index; restart recommended)
-- `clear`
-- `exit`
-
-## Voice clips (prerecorded)
-
-Jarvis prefers prerecorded WAV files in `./voices/`.
-If a clip for a given “key” exists, Jarvis plays it; otherwise it falls back to TTS.
-
-Common keys:
-- `wake.wav` (greeting on startup / wake)
-- `boot.wav` (`test sound`)
-- `confirm.wav` (“Yes, sir?”)
-- `opening.wav` (opening websites/apps)
-- `searching.wav` (searching)
-- `done.wav` (done / navigation)
-- `didnt_udnerstand.wav` (unknown command; key alias: `didnt_understand`)
-- `goodbye.wav` (exit)
-
-## Troubleshooting (no sound)
-
-1. Run `test sound`
-2. If you still hear nothing:
-   - verify Windows output volume is not muted
-   - check that `./.cache/tts.wav` is larger than ~44 bytes
+## Notes
+- If Piper isn’t configured, it will fall back to Windows SAPI voices (pyttsx3).
+- For safety, typing uses the active window; say “open notepad” first if you want a safe target.
 

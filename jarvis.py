@@ -5,11 +5,12 @@ import json
 import queue
 import re
 import socket
+import os
+import sys
 import threading
 import time
 import wave
 import webbrowser
-import winsound
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,9 +32,6 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
 CONFIG_PATH = CONFIG_DIR / "jarvis_config.json"
 
-DEFAULT_PIPER_MODEL = ROOT / "models" / "piper" / "jarvis-medium.onnx"
-DEFAULT_PIPER_MODEL_CONFIG = ROOT / "models" / "piper" / "jarvis-medium.onnx.json"
-
 VOSK_MODEL_DIR = ROOT / "models" / "vosk" / "model"
 VOICE_DIR = ROOT / "voices"
 
@@ -49,7 +47,7 @@ class AppState:
     mic_device_name: str = ""
     mic_level: float = 0.0
     last_error: str = ""
-    tts_mode: str = "sapi"  # "sapi" or "piper"
+    tts_mode: str = "sapi"  # used only as fallback if a clip is missing
 
 
 def load_config() -> dict:
@@ -120,17 +118,6 @@ class Speaker:
         self._sapi = pyttsx3.init()
         self._sapi.setProperty("rate", 185)
 
-        self._piper_voice = None
-        model_path, cfg_path = pick_local_piper_model()
-        if model_path.exists() and cfg_path.exists():
-            try:
-                from piper.voice import PiperVoice  # type: ignore
-
-                self._piper_voice = PiperVoice.load(str(model_path))
-                self.state.tts_mode = "piper"
-            except Exception:
-                self._piper_voice = None
-
         self._audio_lock = threading.Lock()
         self._audio_stream: sd.OutputStream | None = None
         self._audio_rate = 24000  # common for many voice samples
@@ -178,15 +165,23 @@ class Speaker:
         """
         # Support small spelling variations for existing filenames.
         aliases = {
-            "didnt_understand": "didnt_udnerstand",
-            "didnt_understood": "didnt_udnerstand",
             "confirm_yes": "confirm",
             "yes_sir": "confirm",
         }
-        key = aliases.get(key, key)
+        resolved = aliases.get(key, key)
 
-        wav = VOICE_DIR / f"{key}.wav"
-        if wav.exists():
+        # Try a few common filename variants (including historical typo).
+        candidates = [
+            resolved,
+            key,
+        ]
+        if resolved in {"didnt_understand", "didnt_understood"} or key in {"didnt_understand", "didnt_understood"}:
+            candidates.extend(["didnt_understand", "didnt_understood", "didnt_udnerstand"])
+
+        for cand in dict.fromkeys(candidates):  # de-dupe, preserve order
+            wav = VOICE_DIR / f"{cand}.wav"
+            if not wav.exists():
+                continue
             try:
                 data, rate = self._load_wav_int16(wav)
                 if blocking:
@@ -196,7 +191,7 @@ class Speaker:
                 return
             except Exception:
                 # If playback fails, fall back to text-to-speech.
-                pass
+                break
 
         if fallback_text:
             self.say(fallback_text)
@@ -205,10 +200,8 @@ class Speaker:
         text = (text or "").strip()
         if not text:
             return
-        if self.state.tts_mode == "piper" and self._piper_voice is not None:
-            self._say_piper(text)
-        else:
-            self._say_sapi(text)
+        # Fallback only: prerecorded voice pack is preferred everywhere else.
+        self._say_sapi(text)
 
     def _say_sapi(self, text: str) -> None:
         self._sapi.say(text)
@@ -234,25 +227,7 @@ class Speaker:
             data = data.reshape(-1, channels)
         return data, rate
 
-    def _say_piper(self, text: str) -> None:
-        tmp = ROOT / ".cache"
-        tmp.mkdir(exist_ok=True)
-        out_wav = tmp / "tts.wav"
-        try:
-            if self._piper_voice is None:
-                raise RuntimeError("Piper voice not loaded")
-            # piper-tts returns AudioChunk(s); we must write the WAV ourselves.
-            with wave.open(str(out_wav), "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(int(self._piper_voice.config.sample_rate))
-                for chunk in self._piper_voice.synthesize(text):
-                    wf.writeframes(chunk.audio_int16_bytes)
-            self._play_wav(out_wav)
-        except Exception as e:
-            self.state.tts_mode = "sapi"
-            self.state.last_error = f"Piper failed; falling back to SAPI: {e}"
-            self._say_sapi(text)
+    # No neural TTS model: we only play prerecorded clips + SAPI fallback.
 
 
 def orange_banner() -> Text:
@@ -263,22 +238,23 @@ def orange_banner() -> Text:
     return t
 
 
-def pick_local_piper_model() -> tuple[Path, Path]:
+def configure_windows_utf8() -> None:
     """
-    Prefer the user's local model inside ./jarvis/... if present.
-    Fallback to ./models/piper.
+    Make Windows terminals render unicode (avoids '???' for block ASCII art).
+    Safe to call multiple times.
     """
-    preferred = ROOT / "jarvis" / "en" / "en_GB" / "jarvis" / "high" / "jarvis-high.onnx"
-    preferred_cfg = preferred.with_suffix(preferred.suffix + ".json")
-    if preferred.exists() and preferred_cfg.exists():
-        return preferred, preferred_cfg
-
-    preferred2 = ROOT / "jarvis" / "en" / "en_GB" / "jarvis" / "medium" / "jarvis-medium.onnx"
-    preferred2_cfg = preferred2.with_suffix(preferred2.suffix + ".json")
-    if preferred2.exists() and preferred2_cfg.exists():
-        return preferred2, preferred2_cfg
-
-    return DEFAULT_PIPER_MODEL, DEFAULT_PIPER_MODEL_CONFIG
+    if os.name != "nt":
+        return
+    try:
+        # Set UTF-8 code page for the current console.
+        os.system("chcp 65001 >NUL")
+    except Exception:
+        pass
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 def normalize_text(s: str) -> str:
@@ -553,6 +529,7 @@ def socket_reader_loop(sock: socket.socket, out_q: "queue.Queue[str]", stop_evt:
 
 
 def run_ui(connect: tuple[str, int] | None) -> None:
+    configure_windows_utf8()
     console = Console()
     console.clear()
     console.print(orange_banner())
