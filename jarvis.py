@@ -52,10 +52,8 @@ _QWEN_IM_END = "<|" + "im_end" + "|>"
 
 # Longer buffers + small.en (or JARVIS_WHISPER=base.en|medium.en) help accuracy vs tiny chunks on tiny.en.
 _WHISPER_CHUNK_SEC = float(os.environ.get("JARVIS_WHISPER_CHUNK_SEC", "2.2"))
-_WHISPER_INITIAL_PROMPT = (
-    "Jarvis, wake up. Open notepad, search for weather, launch calculator, google maps. "
-    "How is the weather? What time is it?"
-)
+# Do not put questions like "what time is it" here — Whisper repeats them on silence/noise (speaker→mic loop).
+_WHISPER_INITIAL_PROMPT = "English short voice commands: open notepad, launch app, search google, wake up jarvis."
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.03
@@ -65,6 +63,8 @@ pyautogui.PAUSE = 0.03
 class AppState:
     armed_until: float = 0.0
     voice_session_until: float = 0.0
+    # Direct jarvis.py: accept all voice as commands until "sleep" (avoids timer/inf edge cases).
+    local_mic_open_until_sleep: bool = False
     mic_level: float = 0.0
     last_error: str = ""
     tts_mode: str = "sapi"  # used only as fallback if a clip is missing
@@ -72,6 +72,9 @@ class AppState:
     ui_phase_stack: list[str] = field(default_factory=list)
     ui_phase_lock: threading.Lock = field(default_factory=threading.Lock)
     _last_printed_hud_eff: str = field(default="", repr=False)
+    # Drop mic transcripts while Jarvis is playing audio (stops TTS being re-heard as "commands").
+    playback_depth: int = 0
+    playback_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def load_config() -> dict:
@@ -198,6 +201,8 @@ def print_assistant_thinking(console: Console) -> None:
 
 def voice_timeline_phase(state: AppState) -> str:
     now = time.time()
+    if state.local_mic_open_until_sleep:
+        return "listening"
     if now < state.voice_session_until:
         return "listening"
     if now < state.armed_until:
@@ -228,6 +233,7 @@ def pop_voice_phase(state: AppState, console: Console | None) -> None:
 
 
 def print_voice_status_line(console: Console, state: AppState, *, force: bool = False) -> None:
+    """Single-line phase indicator for the bottom dock (see print_prompt_block)."""
     with state.ui_phase_lock:
         override = state.ui_phase_stack[-1] if state.ui_phase_stack else None
     base = voice_timeline_phase(state)
@@ -236,29 +242,27 @@ def print_voice_status_line(console: Console, state: AppState, *, force: bool = 
         return
     state._last_printed_hud_eff = eff
 
-    labels: tuple[tuple[str, str, str], ...] = (
+    # One active row above the prompt, e.g. "◉ LISTENING..."
+    phase_rows: tuple[tuple[str, str, str], ...] = (
         ("● ", "ARMED", "armed"),
         ("◉ ", "LISTENING", "listening"),
         ("◎ ", "PROCESSING", "processing"),
         ("▶ ", "SPEAKING", "speaking"),
     )
     line = Text()
-    for i, (sym, name, key) in enumerate(labels):
-        active = eff == key
-        if active:
-            line.append(sym + name, style=f"bold {T_ACCENT}")
-        else:
-            line.append(sym + name, style=T_INACTIVE)
-        if i + 1 < len(labels):
-            line.append("  ", style=T_INACTIVE)
+    sym, name, _ = next((r for r in phase_rows if r[2] == eff), ("· ", "IDLE", "idle"))
     if eff == "idle" and not override:
-        line.append("  ·  ", style=T_MUTED)
+        line.append("· ", style=T_MUTED)
+        line.append("IDLE", style=T_MUTED)
+        line.append(" — ", style=T_MUTED)
         line.append('say “wake up” to arm', style=f"italic {T_MUTED}")
+    else:
+        line.append(sym + name + "...", style=f"bold {T_ACCENT}")
     console.print(line)
 
 
 def print_prompt_block(console: Console, state: AppState) -> None:
-    """Status row anchored above the input line (orange HUD)."""
+    """Bottom dock: phase line, then branded prompt (utmost bottom is the input cursor)."""
     print_voice_status_line(console, state)
     console.print(Text(PROMPT.strip() + " ", style=f"bold {T_ACCENT}"), end="")
 
@@ -273,7 +277,8 @@ def build_llm_prompt(user_msg: str) -> tuple[str, str | None]:
     """
     path = resolved_llm_gguf_path()
     sys_rules = (
-        "You are J.A.R.V.I.S., a real Windows voice assistant (not fiction, not Marvel or Avengers). "
+        "You are Jarvis, a real Windows voice assistant (not fiction, not Marvel or Avengers). "
+        "Refer to yourself as Jarvis (one word), never as J.A.R.V.I.S. with periods. "
         "Reply in at most 2 short sentences. Be factual; if you do not know, say so. "
         "Answer ONLY this user message. Do not role-play additional User questions, "
         "do not write 'User:' or 'Assistant:' dialogue, and do not continue an imaginary conversation."
@@ -288,6 +293,13 @@ def build_llm_prompt(user_msg: str) -> tuple[str, str | None]:
         return prompt, "<|im_start|>user"
     full_prompt = f"{sys_rules}\n\nUser: {u}\nAssistant:"
     return full_prompt, "\nUser:"
+
+
+def sanitize_assistant_spoken_name(text: str) -> str:
+    """Dotted acronym reads badly through TTS; normalize to one spoken name."""
+    t = text or ""
+    t = re.sub(r"(?i)J\.\s*A\.\s*R\.\s*V\.\s*I\.\s*S\.?", "Jarvis", t)
+    return t
 
 
 def sanitize_llm_reply(text: str) -> str:
@@ -308,6 +320,7 @@ def sanitize_llm_reply(text: str) -> str:
     max_chars = int(os.environ.get("JARVIS_LLM_MAX_REPLY_CHARS", "420"))
     if len(t) > max_chars:
         t = t[:max_chars].rsplit(" ", 1)[0] + "…"
+    t = sanitize_assistant_spoken_name(t)
     return t.strip()
 
 
@@ -321,18 +334,21 @@ def create_whisper_model() -> WhisperModel:
 
 
 def transcribe_audio_chunk(model: WhisperModel, chunk: np.ndarray) -> str:
+    # VAD on by default: cuts silence hallucinations; JARVIS_WHISPER_VAD=0 to disable if short phrases get dropped.
     use_vad = os.environ.get("JARVIS_WHISPER_VAD", "1").strip().lower() not in (
         "0",
         "false",
         "no",
         "off",
     )
+    prompt = os.environ.get("JARVIS_WHISPER_INITIAL_PROMPT", _WHISPER_INITIAL_PROMPT).strip()
     kw: dict = {
         "language": "en",
         "task": "transcribe",
         "beam_size": 5,
-        "initial_prompt": _WHISPER_INITIAL_PROMPT,
     }
+    if prompt:
+        kw["initial_prompt"] = prompt
     if use_vad:
         kw["vad_filter"] = True
         kw["vad_parameters"] = {"min_silence_duration_ms": 250}
@@ -379,9 +395,15 @@ class Speaker:
     def _play_pcm_int16(self, data: np.ndarray, samplerate: int) -> None:
         if data.ndim == 1:
             data = data.reshape(-1, 1)
-        with self._audio_lock:
-            stream = self._ensure_audio_stream(samplerate=samplerate, channels=int(data.shape[1]))
-            stream.write(data.astype(np.int16, copy=False))
+        with self.state.playback_lock:
+            self.state.playback_depth += 1
+        try:
+            with self._audio_lock:
+                stream = self._ensure_audio_stream(samplerate=samplerate, channels=int(data.shape[1]))
+                stream.write(data.astype(np.int16, copy=False))
+        finally:
+            with self.state.playback_lock:
+                self.state.playback_depth -= 1
 
     def _play_pcm_int16_async(self, data: np.ndarray, samplerate: int) -> None:
         t = threading.Thread(target=self._play_pcm_int16, args=(data, samplerate), daemon=True)
@@ -440,8 +462,14 @@ class Speaker:
         speak_with_pocket_tts(text, voice_path=str(VOICE_TEMPLATE), speaker=self, console=self.status_console)
 
     def _say_sapi(self, text: str) -> None:
-        self._sapi.say(text)
-        self._sapi.runAndWait()
+        with self.state.playback_lock:
+            self.state.playback_depth += 1
+        try:
+            self._sapi.say(text)
+            self._sapi.runAndWait()
+        finally:
+            with self.state.playback_lock:
+                self.state.playback_depth -= 1
 
     def _play_wav(self, path: Path) -> None:
         """Play a WAV file synchronously using the warmed stream."""
@@ -736,6 +764,7 @@ def _handle_command_body(state: AppState, speaker: Speaker, cmd: str, console: C
     if cmd in {"sleep", "go to sleep", "stand by", "stop listening"}:
         state.voice_session_until = 0.0
         state.armed_until = 0.0
+        state.local_mic_open_until_sleep = False
         speaker.speak_key("listening_off", "Standing by.")
         return
 
@@ -747,7 +776,6 @@ def _handle_command_body(state: AppState, speaker: Speaker, cmd: str, console: C
         console.clear()
         console.print(orange_banner())
         console.print()
-        print_voice_status_line(console, state, force=True)
         return
 
     if cmd in {"test sound", "test audio"}:
@@ -865,6 +893,7 @@ def speak_with_pocket_tts(
     is passed) prints the assistant line so text appears while the first clip renders.
     """
     text = strip_llm_stream_artifacts((text or "").strip())
+    text = sanitize_assistant_spoken_name(text)
     if not text:
         return
 
@@ -1025,6 +1054,9 @@ def speech_worker(
             try:
                 text = transcribe_audio_chunk(whisper, chunk)
                 if text:
+                    with state.playback_lock:
+                        if state.playback_depth > 0:
+                            continue
                     text_q.put(text)
             except Exception as e:
                 state.last_error = str(e)
@@ -1078,6 +1110,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
         # Terminal is already "live": accept voice commands without a wake phrase until sleep.
         state.voice_session_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
         state.armed_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
+        state.local_mic_open_until_sleep = True
 
     if connect is None:
         ensure_whisper_warm(console)
@@ -1177,6 +1210,9 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             console.print(Text(f"[error] Failed to connect to daemon: {e}", style=T_ERR))
             console.print(Text("Starting local microphone mode instead.", style=T_MUTED))
             connect = None
+            state.voice_session_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
+            state.armed_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
+            state.local_mic_open_until_sleep = True
             ensure_whisper_warm(console)
             speech_thread = threading.Thread(
                 target=speech_worker, args=(speech_q, stop_evt, state, console), daemon=True
@@ -1230,7 +1266,11 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                         now2 = time.time()
                         woke2 = contains_wake_phrase(phrase_norm)
                         in_session2 = now2 < state.voice_session_until
-                        armed2 = (now2 < state.armed_until) or in_session2
+                        armed2 = (
+                            state.local_mic_open_until_sleep
+                            or in_session2
+                            or (now2 < state.armed_until)
+                        )
                         if woke2:
                             state.armed_until = now2 + ARM_SECONDS
                             state.voice_session_until = now2 + VOICE_SESSION_SECONDS
@@ -1282,7 +1322,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
 
             woke = contains_wake_phrase(phrase_norm)
             in_session = now < state.voice_session_until
-            armed = (now < state.armed_until) or in_session
+            armed = state.local_mic_open_until_sleep or in_session or (now < state.armed_until)
             if woke:
                 state.armed_until = now + ARM_SECONDS
                 state.voice_session_until = now + VOICE_SESSION_SECONDS

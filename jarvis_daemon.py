@@ -1,19 +1,57 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent
+if os.name == "nt":
+    _VENV_PY = _ROOT / ".venv" / "Scripts" / "python.exe"
+else:
+    _VENV_PY = _ROOT / ".venv" / "bin" / "python"
+
+
+def _reexec_in_venv_if_needed() -> None:
+    """Running `python jarvis_daemon.py` with system Python misses deps; use .venv automatically."""
+    if __name__ != "__main__":
+        return
+    if not _VENV_PY.is_file():
+        return
+    try:
+        if Path(sys.executable).resolve() == _VENV_PY.resolve():
+            return
+    except OSError:
+        return
+    argv = [str(_VENV_PY), "-u", str(_ROOT / "jarvis_daemon.py"), *sys.argv[1:]]
+    os.execv(str(_VENV_PY), argv)
+
+
+_reexec_in_venv_if_needed()
+
+ROOT = _ROOT
+
 import queue
 import socket
 import subprocess
-import sys
 import threading
 import time
-from pathlib import Path
 
-import sounddevice as sd
 import numpy as np
-import jarvis
+import sounddevice as sd
 
-ROOT = Path(__file__).resolve().parent
+try:
+    import jarvis
+except ModuleNotFoundError as e:
+    if __name__ == "__main__":
+        print(
+            f"Missing dependency ({e}). Use the project venv:\n"
+            f"  cd /d \"{ROOT}\"\n"
+            f"  python -m venv .venv\n"
+            f"  .\\.venv\\Scripts\\pip install -r requirements.txt\n"
+            f"  .\\.venv\\Scripts\\python.exe jarvis_daemon.py\n",
+            file=sys.stderr,
+        )
+    raise
 
 # Only one daemon per machine (this port must stay bound). Running 2+ daemons = many windows on one "wake up".
 _DAEMON_LOCK_PORT = int(os.environ.get("JARVIS_DAEMON_LOCK_PORT", "38471"))
@@ -37,18 +75,48 @@ def start_server() -> tuple[socket.socket, int]:
     return srv, srv.getsockname()[1]
 
 
+def _resolve_ui_python_exe() -> Path | None:
+    """
+    Must be python.exe (real console). pythonw.exe has no console — Jarvis "runs" in Task Manager
+    but no window appears.
+    """
+    p = ROOT / ".venv" / "Scripts" / "python.exe"
+    if p.is_file():
+        return p
+    # Rare: venv only has py launcher; still avoid pythonw for UI.
+    se = Path(sys.executable)
+    if se.name.lower() == "python.exe" and se.is_file():
+        return se
+    return None
+
+
 def launch_ui(port: int) -> subprocess.Popen | None:
-    """Spawn Jarvis in a new console. Returns None if the process could not be started."""
-    py_exe = ROOT / ".venv" / "Scripts" / "python.exe"
-    if not py_exe.is_file():
-        py_exe = ROOT / ".venv" / "Scripts" / "pythonw.exe"
-    args = [str(py_exe), str(ROOT / "jarvis.py"), "--connect", f"127.0.0.1:{port}"]
+    """Spawn Jarvis in a new visible console. Returns None if the process could not be started."""
+    py_exe = _resolve_ui_python_exe()
+    if py_exe is None:
+        print(
+            "ERROR: Need .venv\\Scripts\\python.exe to show the Jarvis window (not pythonw). "
+            "Recreate venv: python -m venv .venv",
+            file=sys.stderr,
+        )
+        return None
+    jarvis_py = ROOT / "jarvis.py"
+    if not jarvis_py.is_file():
+        print(f"ERROR: Missing {jarvis_py}", file=sys.stderr)
+        return None
+    args = [str(py_exe), str(jarvis_py), "--connect", f"127.0.0.1:{port}"]
     kwargs: dict = {"cwd": str(ROOT)}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+        # Nudge Windows to show the new console (some setups leave it backgrounded).
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = getattr(subprocess, "SW_SHOW", 5)  # Win32 SW_SHOW
+        kwargs["startupinfo"] = si
     try:
         return subprocess.Popen(args, **kwargs)
-    except OSError:
+    except OSError as e:
+        print(f"ERROR: Could not start Jarvis UI: {e}", file=sys.stderr)
         return None
 
 
