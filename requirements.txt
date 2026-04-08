@@ -1,6 +1,6 @@
 rich==13.9.4
 pyttsx3==2.98
-vosk==0.3.45
 sounddevice==0.5.1
 pyautogui==0.9.54
 pywin32==311
+faster-whisper==1.1.1

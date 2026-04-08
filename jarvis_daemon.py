@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 
 import sounddevice as sd
-from vosk import KaldiRecognizer, Model
+import numpy as np
+from faster_whisper import WhisperModel
 
 import jarvis
 
@@ -64,35 +65,55 @@ def send_line(client_box: dict[str, socket.socket], text: str) -> None:
 
 
 def speech_loop(stop_evt: threading.Event, heard_q: "queue.Queue[str]", mic_device_index: int | None) -> None:
-    jarvis.ensure_vosk_model_silent()
-    model = Model(str(jarvis.VOSK_MODEL_DIR))
-    rec = KaldiRecognizer(model, 16000)
-    rec.SetWords(False)
+    whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+
+    audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
 
     def callback(indata, frames, time_info, status):
         if status:
             return
-        if rec.AcceptWaveform(bytes(indata)):
-            try:
-                import json
+        mono = indata[:, 0].copy()
+        try:
+            audio_q.put_nowait(mono)
+        except queue.Full:
+            pass
 
-                res = json.loads(rec.Result())
-                txt = (res.get("text") or "").strip()
-                if txt:
-                    heard_q.put(txt)
-            except Exception:
-                return
+    sr = 16000
+    chunk_seconds = 1.1
+    target_len = int(sr * chunk_seconds)
+    buf = np.zeros((0,), dtype=np.float32)
 
-    with sd.RawInputStream(
-        samplerate=16000,
-        blocksize=8000,
-        dtype="int16",
+    with sd.InputStream(
+        samplerate=sr,
+        dtype="float32",
         channels=1,
         callback=callback,
         device=mic_device_index,
     ):
         while not stop_evt.is_set():
-            time.sleep(0.05)
+            try:
+                piece = audio_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            buf = np.concatenate([buf, piece])
+            if buf.shape[0] < target_len:
+                continue
+
+            chunk = buf[:target_len]
+            buf = buf[target_len:]
+
+            try:
+                segments, _info = whisper.transcribe(
+                    chunk,
+                    vad_filter=True,
+                    vad_parameters={"min_silence_duration_ms": 200},
+                )
+                text = " ".join(s.text.strip() for s in segments).strip()
+                if text:
+                    heard_q.put(text)
+            except Exception:
+                time.sleep(0.1)
 
 
 def main() -> None:

@@ -19,8 +19,8 @@ import pyttsx3
 import sounddevice as sd
 from rich.console import Console
 from rich.text import Text
-from vosk import KaldiRecognizer, Model
 import numpy as np
+from faster_whisper import WhisperModel
 
 APP_NAME = "J.A.R.V.I.S."
 PROMPT = "J.A.R.V.I.S. > "
@@ -32,7 +32,6 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
 CONFIG_PATH = CONFIG_DIR / "jarvis_config.json"
 
-VOSK_MODEL_DIR = ROOT / "models" / "vosk" / "model"
 VOICE_DIR = ROOT / "voices"
 
 pyautogui.FAILSAFE = True
@@ -401,114 +400,69 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
 
 
 def speech_worker(text_q: "queue.Queue[str]", stop_evt: threading.Event, state: AppState) -> None:
-    if not (VOSK_MODEL_DIR.exists() and any(VOSK_MODEL_DIR.iterdir())):
-        state.last_error = "Missing Vosk model. Run jarvis once to auto-download it (or re-run setup)."
-        return
+    # faster-whisper (Whisper on CPU) for better accuracy than Vosk.
+    # tiny.en keeps it lightweight and fast.
+    whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
 
-    model = Model(str(VOSK_MODEL_DIR))
-    rec = KaldiRecognizer(model, 16000)
-    rec.SetWords(False)
+    audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
 
     def callback(indata, frames, time_info, status):
         if status:
             return
+        if stop_evt.is_set():
+            return
+        mono = indata[:, 0].copy()
+        state.mic_level = float(np.max(np.abs(mono))) if mono.size else 0.0
         try:
-            import array
-
-            a = array.array("h", bytes(indata))
-            if len(a) > 0:
-                peak = max(abs(x) for x in a)
-                state.mic_level = min(1.0, peak / 32768.0)
-        except Exception:
+            audio_q.put_nowait(mono)
+        except queue.Full:
             pass
 
-        if rec.AcceptWaveform(bytes(indata)):
-            try:
-                res = json.loads(rec.Result())
-                txt = (res.get("text") or "").strip()
-                if txt:
-                    text_q.put(txt)
-            except Exception:
-                return
+    sr = 16000
+    chunk_seconds = 1.1
+    target_len = int(sr * chunk_seconds)
+    buf = np.zeros((0,), dtype=np.float32)
 
-    with sd.RawInputStream(
-        samplerate=16000,
-        blocksize=8000,
-        dtype="int16",
+    with sd.InputStream(
+        samplerate=sr,
+        dtype="float32",
         channels=1,
         callback=callback,
         device=state.mic_device_index,
     ):
         while not stop_evt.is_set():
-            time.sleep(0.05)
+            try:
+                piece = audio_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            buf = np.concatenate([buf, piece])
+            if buf.shape[0] < target_len:
+                continue
+
+            chunk = buf[:target_len]
+            buf = buf[target_len:]
+
+            try:
+                segments, _info = whisper.transcribe(
+                    chunk,
+                    vad_filter=True,
+                    vad_parameters={"min_silence_duration_ms": 200},
+                )
+                text = " ".join(s.text.strip() for s in segments).strip()
+                if text:
+                    text_q.put(text)
+            except Exception as e:
+                state.last_error = str(e)
+                time.sleep(0.1)
 
 
-def ensure_vosk_model_auto(console: Console) -> None:
-    # lightweight auto-install (same as earlier script, but inline)
-    if VOSK_MODEL_DIR.exists() and any(VOSK_MODEL_DIR.iterdir()):
-        return
-
-    console.print("[dim]Downloading offline speech model (first run)…[/dim]")
-    import zipfile
-    from io import BytesIO
-
-    import requests
-
-    url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-    z = zipfile.ZipFile(BytesIO(r.content))
-    tmp = ROOT / ".cache" / "vosk_extract"
-    tmp.mkdir(parents=True, exist_ok=True)
-    z.extractall(tmp)
-    top_dirs = [p for p in tmp.iterdir() if p.is_dir()]
-    if not top_dirs:
-        raise RuntimeError("Unexpected Vosk zip layout")
-    model_root = top_dirs[0]
-    VOSK_MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
-    if VOSK_MODEL_DIR.exists():
-        # best-effort clear
-        for p in sorted(VOSK_MODEL_DIR.rglob("*"), reverse=True):
-            if p.is_file():
-                p.unlink(missing_ok=True)
-            else:
-                try:
-                    p.rmdir()
-                except OSError:
-                    pass
-    model_root.replace(VOSK_MODEL_DIR)
-
-
-def ensure_vosk_model_silent() -> None:
-    if VOSK_MODEL_DIR.exists() and any(VOSK_MODEL_DIR.iterdir()):
-        return
-    import zipfile
-    from io import BytesIO
-
-    import requests
-
-    url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-    z = zipfile.ZipFile(BytesIO(r.content))
-    tmp = ROOT / ".cache" / "vosk_extract"
-    tmp.mkdir(parents=True, exist_ok=True)
-    z.extractall(tmp)
-    top_dirs = [p for p in tmp.iterdir() if p.is_dir()]
-    if not top_dirs:
-        raise RuntimeError("Unexpected Vosk zip layout")
-    model_root = top_dirs[0]
-    VOSK_MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
-    if VOSK_MODEL_DIR.exists():
-        for p in sorted(VOSK_MODEL_DIR.rglob("*"), reverse=True):
-            if p.is_file():
-                p.unlink(missing_ok=True)
-            else:
-                try:
-                    p.rmdir()
-                except OSError:
-                    pass
-    model_root.replace(VOSK_MODEL_DIR)
+def ensure_whisper_warm(console: Console) -> None:
+    """
+    Trigger model download/cache early so the first command isn't slow.
+    """
+    console.print("[dim]Loading speech model (first run may download)…[/dim]")
+    _ = WhisperModel("tiny.en", device="cpu", compute_type="int8")
 
 
 def socket_reader_loop(sock: socket.socket, out_q: "queue.Queue[str]", stop_evt: threading.Event) -> None:
@@ -552,7 +506,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
         save_config(cfg)
 
     if connect is None:
-        ensure_vosk_model_auto(console)
+        ensure_whisper_warm(console)
 
     speaker = Speaker(state)
     # Print immediately, play greeting async for seamless feel.
@@ -587,34 +541,128 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             console.print(Text(f"[error] Failed to connect to daemon: {e}", style="red"))
             console.print(Text("Starting local microphone mode instead.", style="dim"))
             connect = None
-            ensure_vosk_model_auto(console)
+            ensure_whisper_warm(console)
             speech_thread = threading.Thread(target=speech_worker, args=(speech_q, stop_evt, state), daemon=True)
             speech_thread.start()
 
     def speech_loop():
+        pending: list[str] = []
+        pending_started_at = 0.0
+        last_piece_at = 0.0
+        last_final: str = ""
+        last_final_at = 0.0
+
+        def flush_pending() -> str:
+            nonlocal pending, pending_started_at, last_piece_at
+            if not pending:
+                return ""
+            phrase = " ".join(pending).strip()
+            pending = []
+            pending_started_at = 0.0
+            last_piece_at = 0.0
+            return phrase
+
+        def normalize_phrase(s: str) -> str:
+            s = normalize_text(s)
+            # common Whisper artifacts for commands
+            s = re.sub(r"^(the|a)\s+", "", s).strip()
+            s = s.replace(" dot ", ".")
+            s = s.replace(" slash ", "/")
+            s = s.replace(" colon ", ":")
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        def print_heard_and_reprompt(phrase: str) -> None:
+            # Make sure async speech output doesn't stick to the input prompt.
+            console.print()
+            console.print(Text(f"[heard] {phrase}", style="dim"))
+            # Re-print prompt so it "feels" like a terminal assistant
+            console.print(Text(PROMPT, style="bold"), end="")
+
         while not stop_evt.is_set():
             try:
                 heard = speech_q.get(timeout=0.2)
             except queue.Empty:
+                # if we have partials and there's been a pause, flush as one phrase
+                now = time.time()
+                if pending and (now - last_piece_at) > 0.65:
+                    phrase = flush_pending()
+                    if phrase:
+                        phrase_norm = normalize_phrase(phrase)
+                        # de-dupe rapid repeats
+                        if phrase_norm == last_final and (now - last_final_at) < 1.2:
+                            continue
+                        last_final = phrase_norm
+                        last_final_at = now
+                        now2 = time.time()
+                        woke2 = contains_wake_phrase(phrase_norm)
+                        in_session2 = now2 < state.voice_session_until
+                        armed2 = (now2 < state.armed_until) or in_session2
+                        if woke2:
+                            state.armed_until = now2 + ARM_SECONDS
+                            state.voice_session_until = now2 + VOICE_SESSION_SECONDS
+                            cmd2 = strip_wake_phrase(phrase_norm)
+                            if not cmd2:
+                                speaker.speak_key("confirm", "Yes, sir?")
+                                continue
+                        elif not armed2:
+                            continue
+                        else:
+                            cmd2 = phrase_norm
+                        print_heard_and_reprompt(phrase)
+                        try:
+                            handle_command(state, speaker, cmd2, console)
+                            state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
+                        except SystemExit:
+                            stop_evt.set()
+                            return
+                        except Exception as e:
+                            state.last_error = str(e)
+                            console.print(Text(f"[error] {e}", style="red"))
                 continue
 
             now = time.time()
-            woke = contains_wake_phrase(heard)
+            # accumulate pieces into a single phrase
+            piece = heard.strip()
+            if piece:
+                if not pending:
+                    pending_started_at = now
+                pending.append(piece)
+                last_piece_at = now
+
+            # safety: don't let a phrase run too long
+            if pending and (now - pending_started_at) > 2.5:
+                phrase = flush_pending()
+            else:
+                # wait for pause to flush
+                phrase = ""
+
+            if not phrase:
+                continue
+
+            phrase = flush_pending()
+            phrase_norm = normalize_phrase(phrase)
+            if phrase_norm == last_final and (now - last_final_at) < 1.2:
+                continue
+            last_final = phrase_norm
+            last_final_at = now
+
+            woke = contains_wake_phrase(phrase_norm)
             in_session = now < state.voice_session_until
             armed = (now < state.armed_until) or in_session
             if woke:
                 state.armed_until = now + ARM_SECONDS
                 state.voice_session_until = now + VOICE_SESSION_SECONDS
-                cmd = strip_wake_phrase(heard)
+                cmd = strip_wake_phrase(phrase_norm)
                 if not cmd:
                     speaker.speak_key("confirm", "Yes, sir?")
                     continue
             elif not armed:
                 continue
             else:
-                cmd = normalize_text(heard)
+                cmd = phrase_norm
 
-            console.print(Text(f"[heard] {heard}", style="dim"))
+            print_heard_and_reprompt(phrase)
             try:
                 handle_command(state, speaker, cmd, console)
                 # successful command keeps the voice session alive

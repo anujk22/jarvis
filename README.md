@@ -1,15 +1,13 @@
 # Jarvis (Windows voice assistant)
 
-Local, lightweight desktop assistant that:
-- Listens to your microphone (offline speech-to-text via Vosk)
-- Runs simple Windows desktop tasks (open a browser URL, open apps, type text)
-- Shows a Jarvis-like terminal greeting and prompt
-- Speaks back using **either** Windows SAPI (default) **or** an optional local Piper voice model
+Local Jarvis-style assistant that:
 
+- **Speech-to-text**: Whisper (`faster-whisper`, `tiny.en`) on CPU (better than Vosk, still lightweight)
+- **Speech output**: your **prerecorded** `voices/*.wav` clips (SAPI fallback only if a clip is missing)
+- **Actions**: open websites/apps, search, type text
 
-## Setup (Windows)
+## Setup (one time)
 
-### 1) Create venv + install deps
 ```powershell
 cd d:\Coding\Cursor\Jarvis
 python -m venv .venv
@@ -17,33 +15,37 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2) (Optional) Download the Jarvis-style Piper voice
-This project supports running Piper **directly in Python** (via `piper-tts`) and downloading the
-Hugging Face voice model into `models\piper\`.
+## Run
 
-Run:
+### Normal (terminal appears immediately)
 ```powershell
-python .\scripts\download_voice.py --repo jgkawell/jarvis --filename en/en_GB/jarvis/medium/jarvis-medium.onnx --out models\piper\jarvis-medium.onnx
-python .\scripts\download_voice.py --repo jgkawell/jarvis --filename en/en_GB/jarvis/medium/jarvis-medium.onnx.json --out models\piper\jarvis-medium.onnx.json
+cd d:\Coding\Cursor\Jarvis
+.\.venv\Scripts\python.exe .\jarvis.py
 ```
 
-Model source: `https://huggingface.co/jgkawell/jarvis`
-
-### 3) Run
+### Silent daemon (say “wake up” to pop the terminal)
 ```powershell
-python .\jarvis.py
+cd d:\Coding\Cursor\Jarvis
+.\.venv\Scripts\pythonw.exe .\jarvis_daemon.py
 ```
 
-## Voice commands (examples)
-- Say “wake up” then:
-  - “open youtube”
-  - “go to https://news.ycombinator.com”
-  - “search for best lightweight speech recognition”
-  - “open notepad”
-  - “type hello world”
-  - “exit”
+## Voice usage
+
+1. Say **“wake up”** (or “jarvis”) to start a voice session.
+2. Then say commands like:
+   - “open google dot com”
+   - “search for pizza”
+   - “open notepad”
+   - “exit”
+
+Typed commands also work at the prompt:
+`list mics`, `use mic <n>`, `test sound`, `sleep`, `exit`
+
+## Voice clips
+
+Jarvis plays `voices/<key>.wav` when available. Common keys:
+`wake`, `confirm`, `opening`, `searching`, `done`, `goodbye`, `didnt_understand`, `error`, `ok`
 
 ## Notes
-- If Piper isn’t configured, it will fall back to Windows SAPI voices (pyttsx3).
 - For safety, typing uses the active window; say “open notepad” first if you want a safe target.
 
