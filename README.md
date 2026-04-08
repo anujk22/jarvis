@@ -29,6 +29,24 @@ cd d:\Coding\Cursor\Jarvis
 .\.venv\Scripts\pythonw.exe .\jarvis_daemon.py
 ```
 
+## Optional: blazing-fast local LLM (1B) + voice-cloned replies
+
+This uses:
+- **LLM**: `TinyLlama-1.1B-Chat` (GGUF `Q4_K_M`) via **prebuilt llama.cpp** binaries (no compiler needed)
+- **TTS**: `pocket-tts` voice cloning using your `voices/template.wav`
+
+One-time setup:
+
+```powershell
+cd d:\Coding\Cursor\Jarvis
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_llm.ps1
+```
+
+Usage:
+- Type or say: `ask what is 2+2`
+- Type or say: `chat tell me a fun fact`
+
 ## Voice usage
 
 1. Say **“wake up”** (or “jarvis”) to start a voice session.

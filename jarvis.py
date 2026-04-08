@@ -7,6 +7,7 @@ import re
 import socket
 import os
 import sys
+import subprocess
 import threading
 import time
 import wave
@@ -18,6 +19,7 @@ import pyautogui
 import pyttsx3
 import sounddevice as sd
 from rich.console import Console
+from rich.rule import Rule
 from rich.text import Text
 import numpy as np
 from faster_whisper import WhisperModel
@@ -33,6 +35,18 @@ CONFIG_DIR = ROOT / "config"
 CONFIG_PATH = CONFIG_DIR / "jarvis_config.json"
 
 VOICE_DIR = ROOT / "voices"
+VOICE_TEMPLATE = VOICE_DIR / "template.wav"
+LLAMA_COMPLETION = ROOT / "bin" / "llama" / "llama-completion.exe"
+_DEFAULT_LLM = ROOT / "models" / "llm" / "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+# Qwen2.x ChatML end-of-turn token (spell as concat so editors don't mangle it).
+_QWEN_IM_END = "<|" + "im_end" + "|>"
+
+# Longer buffers + small.en (or JARVIS_WHISPER=base.en|medium.en) help accuracy vs tiny chunks on tiny.en.
+_WHISPER_CHUNK_SEC = float(os.environ.get("JARVIS_WHISPER_CHUNK_SEC", "2.2"))
+_WHISPER_INITIAL_PROMPT = (
+    "Jarvis, wake up. Open notepad, search for weather, launch calculator, google maps. "
+    "How is the weather? What time is it?"
+)
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.03
@@ -61,6 +75,136 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def resolved_whisper_model_name() -> str:
+    cfg = load_config()
+    return os.environ.get("JARVIS_WHISPER", cfg.get("whisper_model", "small.en")).strip() or "small.en"
+
+
+def whisper_device_options() -> tuple[str, str]:
+    dev = os.environ.get("JARVIS_WHISPER_DEVICE", "cpu").strip().lower()
+    if dev == "cuda":
+        return "cuda", "float16"
+    return "cpu", "int8"
+
+
+def resolved_llm_gguf_path() -> Path:
+    env = os.environ.get("JARVIS_LLM_MODEL", "").strip()
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return p
+    fallbacks = [
+        _DEFAULT_LLM,
+        ROOT / "models" / "llm" / "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+    ]
+    for c in fallbacks:
+        if c.is_file():
+            return c
+    folder = ROOT / "models" / "llm"
+    if folder.is_dir():
+        found = list(folder.glob("*.gguf"))
+        if found:
+            return max(found, key=lambda x: x.stat().st_size)
+    return _DEFAULT_LLM
+
+
+def is_garbage_llm_input(cmd: str) -> bool:
+    """Typing '4' or other noise should not invoke the LLM."""
+    s = (cmd or "").strip()
+    if not s:
+        return True
+    if re.fullmatch(r"\d+", s):
+        return True
+    if len(s) == 1:
+        return True
+    if len(s) <= 2 and not re.search(r"[a-zA-Z]", s):
+        return True
+    if len(set(s.replace(" ", ""))) == 1 and len(s) <= 4:
+        return True
+    return False
+
+
+def print_user_message(console: Console, text: str, *, via: str) -> None:
+    """via is 'microphone' or 'keyboard'."""
+    lbl = "microphone" if via == "microphone" else "keyboard"
+    console.print(Rule(style="dim"))
+    console.print(Text.assemble(("You ", "bold cyan"), (f"({lbl})", "cyan"), (" · ", "dim"), (text, "white")))
+
+
+def print_assistant_message(console: Console, message: str) -> None:
+    console.print(Text.assemble(("Jarvis", "bold green"), (" · ", "dim"), (message, "white")))
+    console.print()
+
+
+def is_qwen_gguf(path: Path) -> bool:
+    return "qwen" in path.name.lower()
+
+
+def build_llm_prompt(user_msg: str) -> tuple[str, str | None]:
+    """
+    Returns (prompt_for_llama, reverse_prompt_for_multiturn_stop or None).
+    """
+    path = resolved_llm_gguf_path()
+    sys_rules = (
+        "You are J.A.R.V.I.S., a real Windows voice assistant (not fiction, not Marvel or Avengers). "
+        "Reply in at most 2 short sentences. Be factual; if you do not know, say so. "
+        "Answer ONLY this user message. Do not role-play additional User questions, "
+        "do not write 'User:' or 'Assistant:' dialogue, and do not continue an imaginary conversation."
+    )
+    u = (user_msg or "").strip()
+    if is_qwen_gguf(path):
+        prompt = (
+            f"<|im_start|>system\n{sys_rules}{_QWEN_IM_END}\n"
+            f"<|im_start|>user\n{u}{_QWEN_IM_END}\n"
+            f"<|im_start|>assistant\n"
+        )
+        return prompt, "<|im_start|>user"
+    full_prompt = f"{sys_rules}\n\nUser: {u}\nAssistant:"
+    return full_prompt, "\nUser:"
+
+
+def sanitize_llm_reply(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return t
+    if _QWEN_IM_END in t:
+        t = t.split(_QWEN_IM_END)[0].strip()
+    im_start = "<|im_start|>"
+    if im_start in t:
+        t = t.split(im_start)[0].strip()
+    t = re.split(r"(?i)\n\s*(?:User|Human)\s*:\s*", t, maxsplit=1)[0].strip()
+    t = re.split(r"(?i)\s+User\s*:\s*", t, maxsplit=1)[0].strip()
+    t = re.sub(r"(?i)^(Assistant|Jarvis)\s*:\s*", "", t).strip()
+    # Drop fake multiturn on one line: "foo. User: bar"
+    t = re.split(r"(?i)\sUser\s*:\s*", t, maxsplit=1)[0].strip()
+    max_chars = int(os.environ.get("JARVIS_LLM_MAX_REPLY_CHARS", "420"))
+    if len(t) > max_chars:
+        t = t[:max_chars].rsplit(" ", 1)[0] + "…"
+    return t.strip()
+
+
+def create_whisper_model() -> WhisperModel:
+    wmodel = resolved_whisper_model_name()
+    wdev, wcomp = whisper_device_options()
+    try:
+        return WhisperModel(wmodel, device=wdev, compute_type=wcomp)
+    except Exception:
+        return WhisperModel(wmodel, device="cpu", compute_type="int8")
+
+
+def transcribe_audio_chunk(model: WhisperModel, chunk: np.ndarray) -> str:
+    segments, _info = model.transcribe(
+        chunk,
+        language="en",
+        task="transcribe",
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 250},
+        initial_prompt=_WHISPER_INITIAL_PROMPT,
+    )
+    return " ".join(s.text.strip() for s in segments).strip()
 
 
 def list_mics() -> list[tuple[int, str]]:
@@ -199,8 +343,7 @@ class Speaker:
         text = (text or "").strip()
         if not text:
             return
-        # Fallback only: prerecorded voice pack is preferred everywhere else.
-        self._say_sapi(text)
+        speak_with_pocket_tts(text, voice_path=str(VOICE_TEMPLATE), speaker=self)
 
     def _say_sapi(self, text: str) -> None:
         self._sapi.say(text)
@@ -225,8 +368,6 @@ class Speaker:
         if channels > 1:
             data = data.reshape(-1, channels)
         return data, rate
-
-    # No neural TTS model: we only play prerecorded clips + SAPI fallback.
 
 
 def orange_banner() -> Text:
@@ -311,9 +452,174 @@ def type_text(text: str) -> None:
     pyautogui.typewrite(text, interval=0.01)
 
 
+def expand_spoken_command(cmd: str) -> str:
+    """
+    Map common paraphrases to the fixed command phrases handle_command expects,
+    so Whisper output like "please launch notepad" still runs actions without an LLM router.
+    """
+    s = normalize_text(cmd)
+    if not s:
+        return s
+
+    s = re.sub(r"^(please|can you|could you|will you|hey)\s+", "", s).strip()
+    s = re.sub(r"^(i\s+(?:would\s+)?like\s+to|i\s+(?:want|need)\s+to)\s+", "", s).strip()
+
+    s = re.sub(r"^(launch|start)\s+", "open ", s)
+
+    m = re.match(r"^(i\s+(?:want|need)\s+to\s+)(?:open|launch|start)\s+(.+)$", s)
+    if m:
+        return f"open {m.group(2).strip()}"
+
+    m = re.match(r"^(open|launch|start)\s+(.+)$", s)
+    if m:
+        rest = re.sub(r"^(the|a)\s+", "", m.group(2).strip())
+        return f"open {rest}"
+
+    if not re.match(r"^(open|go to|navigate to|search for|type|ask|chat)\s", s):
+        m = re.match(r"^(write|type)\s+(.+)$", s)
+        if m:
+            return f"type {m.group(2).strip()}"
+
+    if not re.match(r"^(open|go to|navigate to|search for|type|ask|chat)\s", s):
+        if not re.search(r"\b(what|who|why|how|when|which|define|explain|capital of)\b", s):
+            m = re.search(r"\b(?:google|search(?:\s+for)?|look\s+up)\s+(?:for\s+)?(.+)$", s)
+            if m:
+                q = m.group(1).strip()
+                q = re.sub(r"^(the|a)\s+", "", q)
+                if len(q) > 1:
+                    return f"search for {q}"
+
+    return s
+
+
+def dispatch_open_target(target: str, speaker: Speaker) -> None:
+    target = target.strip()
+    if not target:
+        return
+    quick_sites = {
+        "youtube": "https://www.youtube.com",
+        "google": "https://www.google.com",
+        "gmail": "https://mail.google.com",
+        "github": "https://github.com",
+    }
+    key = target.lower()
+    if key in quick_sites:
+        open_url(quick_sites[key])
+        speaker.speak_key("opening", f"Opening {key}.")
+        return
+    if re.search(r"\.|https?://", target):
+        open_url(target)
+        speaker.speak_key("opening", "Opening it.")
+        return
+    open_app(target)
+    speaker.speak_key("opening", f"Opening {target}.")
+
+
+def _llama_postprocess_stdout(out: str) -> str:
+    lines = []
+    for ln in (out or "").strip().splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith(("load_", "main:", "llama_", "common_", "print_info:", "system_info:", "sampler", "generate:")):
+            continue
+        lines.append(s)
+    text = " ".join(lines).strip()
+    if " Q:" in text:
+        text = text.split(" Q:", 1)[0].strip()
+    return text
+
+
+def run_llama_prompt(
+    prompt: str,
+    *,
+    n_predict: int = 192,
+    temp: float = 0.2,
+    reverse_prompt: str | None = None,
+) -> str:
+    model_path = resolved_llm_gguf_path()
+    if not LLAMA_COMPLETION.exists() or not model_path.is_file():
+        return ""
+
+    threads = os.environ.get("JARVIS_LLM_THREADS", "8").strip() or "8"
+    args = [
+        str(LLAMA_COMPLETION),
+        "-m",
+        str(model_path),
+        "-p",
+        prompt,
+        "--temp",
+        str(temp),
+        "--top-p",
+        "0.85",
+        "--n-predict",
+        str(n_predict),
+        "-no-cnv",
+        "--no-display-prompt",
+        "--color",
+        "off",
+        "--threads",
+        threads,
+    ]
+    if reverse_prompt:
+        args.extend(["--reverse-prompt", reverse_prompt])
+
+    try:
+        p = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            check=False,
+        )
+        return _llama_postprocess_stdout(p.stdout or "")
+    except Exception:
+        return ""
+
+
+def _split_tts_chunks(text: str, max_len: int = 380) -> list[str]:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    out: list[str] = []
+    buf = ""
+    for p in parts:
+        if not p:
+            continue
+        if len(buf) + len(p) + 1 <= max_len:
+            buf = f"{buf} {p}".strip() if buf else p
+        else:
+            if buf:
+                out.append(buf)
+            if len(p) <= max_len:
+                buf = p
+            else:
+                for i in range(0, len(p), max_len):
+                    out.append(p[i : i + max_len])
+                buf = ""
+    if buf:
+        out.append(buf)
+    return [x for x in out if x]
+
+
 def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console) -> None:
     cmd = normalize_text(cmd)
+    cmd = expand_spoken_command(cmd)
     if not cmd:
+        return
+
+    m = re.match(r"^(ask|chat)\s+(.+)$", cmd)
+    if m:
+        question = m.group(2).strip()
+        if is_garbage_llm_input(question):
+            speaker.speak_key("didnt_understand", "I did not catch that, sir.")
+            return
+        answer = llm_answer(question)
+        speak_with_pocket_tts(answer, voice_path=str(VOICE_TEMPLATE), speaker=speaker, console=console)
         return
 
     if cmd in {"sleep", "go to sleep", "stand by", "stop listening"}:
@@ -359,23 +665,7 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
 
     m = re.match(r"^(open)\s+(.+)$", cmd)
     if m:
-        target = m.group(2).strip()
-        quick_sites = {
-            "youtube": "https://www.youtube.com",
-            "google": "https://www.google.com",
-            "gmail": "https://mail.google.com",
-            "github": "https://github.com",
-        }
-        if target in quick_sites:
-            open_url(quick_sites[target])
-            speaker.speak_key("opening", f"Opening {target}.")
-            return
-        if re.search(r"\.|https?://", target):
-            open_url(target)
-            speaker.speak_key("opening", "Opening it.")
-            return
-        open_app(target)
-        speaker.speak_key("opening", f"Opening {target}.")
+        dispatch_open_target(m.group(2).strip(), speaker)
         return
 
     m = re.match(r"^(go to|navigate to)\s+(.+)$", cmd)
@@ -396,13 +686,151 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
         speaker.speak_key("done", "Done.")
         return
 
-    speaker.speak_key("didnt_understand", "Sorry, I did not understand that.")
+    handle_natural_language(state, speaker, console, cmd)
+
+
+def llm_answer(prompt: str) -> str:
+    """
+    Local GGUF via llama.cpp. Default: Qwen2.5-1.5B-Instruct (see setup_llm.ps1) or JARVIS_LLM_MODEL.
+    """
+    if not LLAMA_COMPLETION.exists() or not resolved_llm_gguf_path().is_file():
+        return "LLM not installed yet. Run scripts\\setup_llm.ps1."
+
+    full_prompt, rev = build_llm_prompt(prompt)
+    n_pred = int(os.environ.get("JARVIS_LLM_N_PREDICT", "140"))
+    answer = run_llama_prompt(full_prompt, n_predict=n_pred, temp=0.2, reverse_prompt=rev)
+    return sanitize_llm_reply(answer if answer else "I don't have a response.")
+
+
+def handle_natural_language(state: AppState, speaker: Speaker, console: Console, cmd: str) -> None:
+    """
+    Conversational fallback when no scripted command matched: local LLM answer + pocket-tts voice.
+    Action-style phrases are handled by expand_spoken_command + fixed matchers first.
+    """
+    if is_garbage_llm_input(cmd):
+        speaker.speak_key("didnt_understand", "I did not catch that, sir.")
+        return
+
+    reply = llm_answer(cmd)
+    if reply.startswith("LLM error:") or "not installed" in reply.lower():
+        speaker.speak_key("didnt_understand", "Sorry, I did not understand that.")
+        if reply:
+            console.print(Text(reply, style="dim"))
+        return
+    speak_with_pocket_tts(reply, voice_path=str(VOICE_TEMPLATE), speaker=speaker, console=console)
+
+
+def _pocket_tts_generate_wav(text_chunk: str, vpath: Path, out_path: Path) -> bool:
+    device = os.environ.get("JARVIS_POCKET_DEVICE", "cpu").strip() or "cpu"
+    max_tok = os.environ.get("JARVIS_POCKET_MAX_TOKENS", "200").strip() or "200"
+    p = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pocket_tts",
+            "generate",
+            "-q",
+            "--voice",
+            str(vpath),
+            "--text",
+            text_chunk,
+            "--output-path",
+            str(out_path),
+            "--device",
+            device,
+            "--max-tokens",
+            max_tok,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return out_path.is_file() and out_path.stat().st_size > 400
+
+
+def speak_with_pocket_tts(
+    text: str,
+    voice_path: str,
+    speaker: Speaker,
+    *,
+    console: Console | None = None,
+) -> None:
+    """
+    Voice-clone via Pocket-TTS. Starts audio generation in a background thread, then (when console
+    is passed) prints the assistant line so text appears while the first clip renders.
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+
+    vpath = Path(voice_path)
+    if not vpath.is_file():
+        if console:
+            print_assistant_message(console, text)
+        speaker._say_sapi(text)
+        return
+
+    chunk_max = int(os.environ.get("JARVIS_TTS_CHUNK_CHARS", "520"))
+
+    try:
+        cache_dir = ROOT / ".cache"
+        cache_dir.mkdir(exist_ok=True)
+        chunks = _split_tts_chunks(text, max_len=chunk_max)
+        if not chunks:
+            return
+
+        if len(chunks) == 1:
+            out_path = cache_dir / f"pocket_one_{time.time_ns() & 0xFFFFFFFF}.wav"
+            done = threading.Event()
+            ok_box: list[bool] = [False]
+
+            def gen_one() -> None:
+                ok_box[0] = _pocket_tts_generate_wav(chunks[0], vpath, out_path)
+                done.set()
+
+            threading.Thread(target=gen_one, daemon=True).start()
+            if console:
+                print_assistant_message(console, text)
+            done.wait(timeout=180)
+            if ok_box[0] and out_path.is_file():
+                speaker._play_wav(out_path)
+            else:
+                speaker._say_sapi(text)
+            return
+
+        q: "queue.Queue[tuple[int, Path | None]]" = queue.Queue()
+
+        def producer() -> None:
+            for i, ch in enumerate(chunks):
+                outp = cache_dir / f"pocket_{i}_{time.time_ns() & 0xFFFFFFFF}.wav"
+                if _pocket_tts_generate_wav(ch, vpath, outp):
+                    q.put((i, outp))
+                else:
+                    q.put((i, None))
+                    return
+
+        threading.Thread(target=producer, daemon=True).start()
+        if console:
+            print_assistant_message(console, text)
+
+        for expect_i in range(len(chunks)):
+            _idx, path = q.get()
+            if path is None:
+                speaker._say_sapi(" ".join(chunks[expect_i:]).strip() or text)
+                return
+            speaker._play_wav(path)
+
+        return
+    except Exception:
+        pass
+
+    if console:
+        print_assistant_message(console, text)
+    speaker._say_sapi(text)
 
 
 def speech_worker(text_q: "queue.Queue[str]", stop_evt: threading.Event, state: AppState) -> None:
-    # faster-whisper (Whisper on CPU) for better accuracy than Vosk.
-    # tiny.en keeps it lightweight and fast.
-    whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    whisper = create_whisper_model()
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
 
@@ -419,7 +847,7 @@ def speech_worker(text_q: "queue.Queue[str]", stop_evt: threading.Event, state: 
             pass
 
     sr = 16000
-    chunk_seconds = 1.1
+    chunk_seconds = _WHISPER_CHUNK_SEC
     target_len = int(sr * chunk_seconds)
     buf = np.zeros((0,), dtype=np.float32)
 
@@ -444,12 +872,7 @@ def speech_worker(text_q: "queue.Queue[str]", stop_evt: threading.Event, state: 
             buf = buf[target_len:]
 
             try:
-                segments, _info = whisper.transcribe(
-                    chunk,
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 200},
-                )
-                text = " ".join(s.text.strip() for s in segments).strip()
+                text = transcribe_audio_chunk(whisper, chunk)
                 if text:
                     text_q.put(text)
             except Exception as e:
@@ -461,8 +884,10 @@ def ensure_whisper_warm(console: Console) -> None:
     """
     Trigger model download/cache early so the first command isn't slow.
     """
-    console.print("[dim]Loading speech model (first run may download)…[/dim]")
-    _ = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    wmodel = resolved_whisper_model_name()
+    wdev, _ = whisper_device_options()
+    console.print(f"[dim]Loading speech model {wmodel!r} ({wdev}) — first run may download…[/dim]")
+    _ = create_whisper_model()
 
 
 def socket_reader_loop(sock: socket.socket, out_q: "queue.Queue[str]", stop_evt: threading.Event) -> None:
@@ -509,12 +934,52 @@ def run_ui(connect: tuple[str, int] | None) -> None:
         ensure_whisper_warm(console)
 
     speaker = Speaker(state)
+
+    def pocket_tts_warmup_background() -> None:
+        if not VOICE_TEMPLATE.is_file():
+            return
+
+        def run() -> None:
+            cache_dir = ROOT / ".cache"
+            cache_dir.mkdir(exist_ok=True)
+            outp = cache_dir / "_jarvis_pocket_warmup.wav"
+            try:
+                dev = os.environ.get("JARVIS_POCKET_DEVICE", "cpu").strip() or "cpu"
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pocket_tts",
+                        "generate",
+                        "-q",
+                        "--voice",
+                        str(VOICE_TEMPLATE),
+                        "--device",
+                        dev,
+                        "--text",
+                        "Ready.",
+                        "--output-path",
+                        str(outp),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    pocket_tts_warmup_background()
+
     # Print immediately, play greeting async for seamless feel.
     console.print(Text("Welcome, Sir.", style="bold white"))
     console.print(Text("How may I assist you today?", style="bold white"))
     speaker.speak_key("wake", "Welcome, sir. How may I assist you today?", blocking=False)
     console.print()
-    console.print(Text("I can open websites, apps, and type text.", style="dim"))
+    console.print(Text("I can open websites, apps, type text, and answer questions via the local LLM.", style="dim"))
+    console.print(Text("Say things like “launch notepad”, “google …”, or ask anything after wake.", style="dim"))
     console.print(Text("Commands: clear, exit, list mics, use mic <n>, test sound", style="dim"))
     if connect is not None:
         console.print(Text("Speech: connected (wake up to arm)", style="dim"))
@@ -572,12 +1037,9 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             s = re.sub(r"\s+", " ", s).strip()
             return s
 
-        def print_heard_and_reprompt(phrase: str) -> None:
-            # Make sure async speech output doesn't stick to the input prompt.
+        def log_voice_turn(phrase: str) -> None:
             console.print()
-            console.print(Text(f"[heard] {phrase}", style="dim"))
-            # Re-print prompt so it "feels" like a terminal assistant
-            console.print(Text(PROMPT, style="bold"), end="")
+            print_user_message(console, phrase, via="microphone")
 
         while not stop_evt.is_set():
             try:
@@ -609,7 +1071,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                             continue
                         else:
                             cmd2 = phrase_norm
-                        print_heard_and_reprompt(phrase)
+                        log_voice_turn(phrase)
                         try:
                             handle_command(state, speaker, cmd2, console)
                             state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
@@ -662,7 +1124,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             else:
                 cmd = phrase_norm
 
-            print_heard_and_reprompt(phrase)
+            log_voice_turn(phrase)
             try:
                 handle_command(state, speaker, cmd, console)
                 # successful command keeps the voice session alive
@@ -683,6 +1145,10 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                 cmd = input(PROMPT)
             except (EOFError, KeyboardInterrupt):
                 raise SystemExit(0)
+            cmd_stripped = (cmd or "").strip()
+            if cmd_stripped:
+                console.print()
+                print_user_message(console, cmd_stripped, via="keyboard")
             handle_command(state, speaker, cmd, console)
     except SystemExit:
         stop_evt.set()

@@ -9,8 +9,6 @@ from pathlib import Path
 
 import sounddevice as sd
 import numpy as np
-from faster_whisper import WhisperModel
-
 import jarvis
 
 ROOT = Path(__file__).resolve().parent
@@ -65,7 +63,7 @@ def send_line(client_box: dict[str, socket.socket], text: str) -> None:
 
 
 def speech_loop(stop_evt: threading.Event, heard_q: "queue.Queue[str]", mic_device_index: int | None) -> None:
-    whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+    whisper = jarvis.create_whisper_model()
 
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
 
@@ -79,7 +77,7 @@ def speech_loop(stop_evt: threading.Event, heard_q: "queue.Queue[str]", mic_devi
             pass
 
     sr = 16000
-    chunk_seconds = 1.1
+    chunk_seconds = jarvis._WHISPER_CHUNK_SEC
     target_len = int(sr * chunk_seconds)
     buf = np.zeros((0,), dtype=np.float32)
 
@@ -104,12 +102,7 @@ def speech_loop(stop_evt: threading.Event, heard_q: "queue.Queue[str]", mic_devi
             buf = buf[target_len:]
 
             try:
-                segments, _info = whisper.transcribe(
-                    chunk,
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 200},
-                )
-                text = " ".join(s.text.strip() for s in segments).strip()
+                text = jarvis.transcribe_audio_chunk(whisper, chunk)
                 if text:
                     heard_q.put(text)
             except Exception:
