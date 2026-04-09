@@ -1036,7 +1036,23 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
         end_voice_command(state)
 
 
+def _ack_search_intent_prerecorded(cmd: str, speaker: Speaker) -> None:
+    """
+    When the user clearly mentions search (\bsearch\b), play voices/searching.wav right away
+    (non-blocking) so feedback feels instant before opening the browser or running the LLM.
+    Skips ask/chat questions and \"open …\" so we don't misfire on \"open Search\"-style phrasing.
+    """
+    if not re.search(r"\bsearch\b", cmd):
+        return
+    if re.match(r"^(ask|chat)\s", cmd):
+        return
+    if re.match(r"^open\s+", cmd):
+        return
+    speaker.speak_key("searching", "Searching.", blocking=False)
+
+
 def _handle_command_body(state: AppState, speaker: Speaker, cmd: str, console: Console) -> None:
+    _ack_search_intent_prerecorded(cmd, speaker)
     m = re.match(r"^(ask|chat)\s+(.+)$", cmd)
     if m:
         question = m.group(2).strip()
@@ -1082,7 +1098,6 @@ def _handle_command_body(state: AppState, speaker: Speaker, cmd: str, console: C
     m = re.match(r"^(search for)\s+(.+)$", cmd)
     if m:
         open_search(m.group(2).strip())
-        speaker.speak_key("searching", "Searching.")
         return
 
     m = re.match(r"^(type)\s+(.+)$", cmd)
