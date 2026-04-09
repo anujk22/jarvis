@@ -119,7 +119,47 @@ def launch_ui(port: int) -> subprocess.Popen | None:
         return None
 
 
-def accept_client(srv: socket.socket, client_box: dict[str, socket.socket], stop_evt: threading.Event) -> None:
+def _client_control_reader(
+    sock: socket.socket,
+    mic_sup: jarvis.MicInputSuppression,
+    stop_evt: threading.Event,
+    client_box: dict[str, socket.socket],
+) -> None:
+    """Read UI → daemon control lines on the same socket used for outbound transcripts."""
+    buf = b""
+    try:
+        while not stop_evt.is_set():
+            try:
+                chunk = sock.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", errors="ignore").strip()
+                if line == jarvis.DAEMON_MIC_BUSY_TOKEN:
+                    mic_sup.acquire()
+                elif line == jarvis.DAEMON_MIC_IDLE_TOKEN:
+                    mic_sup.release()
+    finally:
+        mic_sup.reset()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        old = client_box.get("client")
+        if old is sock:
+            client_box.pop("client", None)
+
+
+def accept_client(
+    srv: socket.socket,
+    client_box: dict[str, socket.socket],
+    stop_evt: threading.Event,
+    mic_sup: jarvis.MicInputSuppression,
+) -> None:
     while not stop_evt.is_set():
         try:
             c, _ = srv.accept()
@@ -132,6 +172,11 @@ def accept_client(srv: socket.socket, client_box: dict[str, socket.socket], stop
                 except Exception:
                     pass
             client_box["client"] = c
+            threading.Thread(
+                target=_client_control_reader,
+                args=(c, mic_sup, stop_evt, client_box),
+                daemon=True,
+            ).start()
         except Exception:
             time.sleep(0.2)
 
@@ -150,9 +195,11 @@ def send_line(client_box: dict[str, socket.socket], text: str) -> None:
         client_box.pop("client", None)
 
 
-def speech_loop(stop_evt: threading.Event, heard_q: "queue.Queue[str]") -> None:
+def speech_loop(stop_evt: threading.Event, heard_q: "queue.Queue[str]", mic_sup: jarvis.MicInputSuppression) -> None:
     whisper = jarvis.create_whisper_model()
-    jarvis.mic_utterances_to_queue(heard_q, stop_evt, whisper, state=None)
+    jarvis.mic_utterances_to_queue(
+        heard_q, stop_evt, whisper, state=None, mic_suppressed=mic_sup.is_active
+    )
 
 
 def _acquire_singleton_lock() -> socket.socket:
@@ -179,12 +226,13 @@ def main() -> None:
     srv, port = start_server()
     stop_evt = threading.Event()
     client_box: dict[str, socket.socket] = {}
+    mic_sup = jarvis.MicInputSuppression()
 
-    t_accept = threading.Thread(target=accept_client, args=(srv, client_box, stop_evt), daemon=True)
+    t_accept = threading.Thread(target=accept_client, args=(srv, client_box, stop_evt, mic_sup), daemon=True)
     t_accept.start()
 
     heard_q: "queue.Queue[str]" = queue.Queue()
-    t_speech = threading.Thread(target=speech_loop, args=(stop_evt, heard_q), daemon=True)
+    t_speech = threading.Thread(target=speech_loop, args=(stop_evt, heard_q, mic_sup), daemon=True)
     t_speech.start()
 
     child_proc: dict[str, subprocess.Popen | None | _UiLaunchInProgress] = {"p": None}

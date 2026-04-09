@@ -29,6 +29,33 @@ cd <path-to-this-repo>
 .\.venv\Scripts\pythonw.exe .\jarvis_daemon.py
 ```
 
+### With full-screen audio visualizer (Three.js)
+
+Starts a local static server and opens **Chrome or Edge in kiosk mode** (Windows) so the visualizer follows Jarvis speech output (PCM from this run).
+
+```powershell
+cd <path-to-this-repo>
+.\.venv\Scripts\python.exe .\jarvis.py --visualize
+```
+
+You can also enable it with an environment variable (works for direct runs and for **`jarvis_daemon.py`**—the daemon passes `--visualize` when it launches the UI):
+
+```powershell
+cd <path-to-this-repo>
+$env:JARVIS_VISUALIZE = "1"
+.\.venv\Scripts\python.exe .\jarvis.py
+```
+
+**First-time build:** the app expects `audiovisualizer/dist/` (Parcel bundle). If `dist` is missing but `audiovisualizer/package.json` exists, Jarvis will try `npm install` and `npm run build` automatically when `npm` is on your PATH. To build manually:
+
+```powershell
+cd <path-to-this-repo>\audiovisualizer
+npm install
+npm run build
+```
+
+If the `audiovisualizer` folder is absent, add or restore that bundle from your source of the project; Jarvis will error with a clear message if it cannot find it.
+
 ## Optional: blazing-fast local LLM (1B) + voice-cloned replies
 
 This uses:

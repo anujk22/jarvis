@@ -13,6 +13,7 @@ import threading
 import time
 import wave
 import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,6 +49,34 @@ VOICE_SESSION_SECONDS = 300  # keep voice active after wake
 # Direct jarvis.py (no --connect): mic stays in-session until "sleep" (no wake phrase required).
 _MIC_SESSION_ALWAYS_UNTIL_SLEEP = float("inf")
 
+# UI → daemon: same TCP socket, control lines (not user transcripts) to pause STT while the UI runs a command.
+DAEMON_MIC_BUSY_TOKEN = "__JARVIS_MIC_BUSY__"
+DAEMON_MIC_IDLE_TOKEN = "__JARVIS_MIC_IDLE__"
+
+
+class MicInputSuppression:
+    """Process-local depth counter: when >0, mic pipeline discards audio and skips Whisper enqueue."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._depth = 0
+
+    def acquire(self) -> None:
+        with self._lock:
+            self._depth += 1
+
+    def release(self) -> None:
+        with self._lock:
+            self._depth = max(0, self._depth - 1)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._depth = 0
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._depth > 0
+
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = ROOT / "config"
 CONFIG_PATH = CONFIG_DIR / "jarvis_config.json"
@@ -60,7 +89,7 @@ _DEFAULT_LLM = ROOT / "models" / "llm" / "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 _QWEN_IM_END = "<|" + "im_end" + "|>"
 
 # Mic → one Whisper run per utterance: buffer until this many seconds of quiet (RMS below threshold).
-_JARVIS_UTT_END_SILENCE_SEC = float(os.environ.get("JARVIS_UTT_END_SILENCE_SEC", "0.85"))
+_JARVIS_UTT_END_SILENCE_SEC = float(os.environ.get("JARVIS_UTT_END_SILENCE_SEC", "0.6"))
 _JARVIS_UTT_MIN_SEC = float(os.environ.get("JARVIS_UTT_MIN_SEC", "0.35"))
 _JARVIS_UTT_MAX_SEC = float(os.environ.get("JARVIS_UTT_MAX_SEC", "28.0"))
 _JARVIS_UTT_RMS = float(os.environ.get("JARVIS_UTT_RMS", "0.011"))
@@ -87,6 +116,13 @@ class AppState:
     # Drop mic transcripts while Jarvis is playing audio (stops TTS being re-heard as "commands").
     playback_depth: int = 0
     playback_lock: threading.Lock = field(default_factory=threading.Lock)
+    # While >0: command is running (LLM/TTS pipeline); discard mic input so overlap cannot queue another turn.
+    command_busy_depth: int = 0
+    mic_control_socket: socket.socket | None = None
+    mic_control_send_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Refcount for daemon mic suppression: command + each playback so IDLE is never sent mid-speech.
+    daemon_mic_hold_depth: int = 0
+    daemon_hold_lock: threading.Lock = field(default_factory=threading.Lock)
     threejs_viz: JarvisThreeJsVizState | None = None
 
 
@@ -376,6 +412,9 @@ def transcribe_utterance_audio(
         "language": "en",
         "task": "transcribe",
         "beam_size": 5,
+        "best_of": 1,
+        "temperature": 0.0,
+        "without_timestamps": True,
     }
     if prompt:
         kw["initial_prompt"] = prompt
@@ -389,11 +428,22 @@ def mic_utterances_to_queue(
     whisper: WhisperModel,
     *,
     state: AppState | None,
+    mic_suppressed: Callable[[], bool] | None = None,
 ) -> None:
     """
     Read mic until the user pauses (~end silence), run Whisper once on the whole buffer, enqueue text.
-    Optional AppState for mic_level + skipping transcription during TTS playback (local UI only).
+    Optional AppState for mic level and for skipping/dropping audio while Jarvis runs a command or plays TTS.
+    When ``mic_suppressed`` is set (e.g. daemon UI-busy gate), it is combined with that AppState logic.
     """
+    def suppressed() -> bool:
+        if mic_suppressed is not None and mic_suppressed():
+            return True
+        if state is not None:
+            with state.playback_lock:
+                if state.playback_depth > 0 or state.command_busy_depth > 0:
+                    return True
+        return False
+
     audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=64)
 
     def callback(indata, frames, time_info, status):
@@ -433,6 +483,11 @@ def mic_utterances_to_queue(
             except queue.Empty:
                 piece = None
 
+            if suppressed():
+                utt = np.zeros((0,), dtype=np.float32)
+                last_voice_t = None
+                continue
+
             now = time.time()
             if piece is not None:
                 rms = float(np.sqrt(np.mean(np.square(piece))))
@@ -450,7 +505,7 @@ def mic_utterances_to_queue(
                 to_send = utt.copy()
                 utt = np.zeros((0,), dtype=np.float32)
                 last_voice_t = None
-                _enqueue_transcription(whisper, to_send, text_q, state)
+                _enqueue_transcription(whisper, to_send, text_q, state=state, suppressed=suppressed)
                 continue
 
             if (
@@ -461,26 +516,28 @@ def mic_utterances_to_queue(
                 to_send = utt
                 utt = np.zeros((0,), dtype=np.float32)
                 last_voice_t = None
-                _enqueue_transcription(whisper, to_send, text_q, state)
+                _enqueue_transcription(whisper, to_send, text_q, state=state, suppressed=suppressed)
 
 
 def _enqueue_transcription(
     whisper: WhisperModel,
     audio_f32: np.ndarray,
     text_q: "queue.Queue[str]",
+    *,
     state: AppState | None,
+    suppressed: Callable[[], bool],
 ) -> None:
     try:
+        if suppressed():
+            return
         text = transcribe_utterance_audio(whisper, audio_f32, 16000)
         if not text:
             return
         # Guard: on near-silence, Whisper can emit the initial prompt itself.
         if normalize_text(text) == normalize_text(os.environ.get("JARVIS_WHISPER_INITIAL_PROMPT", _WHISPER_INITIAL_PROMPT)):
             return
-        if state is not None:
-            with state.playback_lock:
-                if state.playback_depth > 0:
-                    return
+        if suppressed():
+            return
         text_q.put(text)
     except Exception as e:
         if state is not None:
@@ -540,6 +597,7 @@ class Speaker:
             if n_lead > 0:
                 pad = np.zeros((n_lead, ch), dtype=np.int16)
                 data = np.concatenate([pad, data.astype(np.int16, copy=False)], axis=0)
+        daemon_mic_hold_change(self.state, 1)
         with self.state.playback_lock:
             self.state.playback_depth += 1
         try:
@@ -559,6 +617,7 @@ class Speaker:
         finally:
             with self.state.playback_lock:
                 self.state.playback_depth -= 1
+            daemon_mic_hold_change(self.state, -1)
 
     def _play_pcm_int16_async(self, data: np.ndarray, samplerate: int) -> None:
         t = threading.Thread(target=self._play_pcm_int16, args=(data, samplerate), daemon=True)
@@ -624,6 +683,7 @@ class Speaker:
         speak_with_pocket_tts(text, voice_path=str(VOICE_TEMPLATE), speaker=self, console=self.status_console)
 
     def _say_sapi(self, text: str) -> None:
+        daemon_mic_hold_change(self.state, 1)
         with self.state.playback_lock:
             self.state.playback_depth += 1
         try:
@@ -632,6 +692,7 @@ class Speaker:
         finally:
             with self.state.playback_lock:
                 self.state.playback_depth -= 1
+            daemon_mic_hold_change(self.state, -1)
 
     def _play_wav(self, path: Path) -> None:
         """Play a WAV file synchronously using the warmed stream."""
@@ -913,6 +974,49 @@ def _split_tts_chunks(text: str, max_len: int = 380) -> list[str]:
     return [x for x in out if x]
 
 
+def _notify_daemon_mic_busy(state: AppState, busy: bool) -> None:
+    """Send one BUSY/IDLE transition to jarvis_daemon (tokens are refcounted by daemon_mic_hold_change)."""
+    s = state.mic_control_socket
+    if s is None:
+        return
+    tok = DAEMON_MIC_BUSY_TOKEN if busy else DAEMON_MIC_IDLE_TOKEN
+    payload = (tok + "\n").encode("utf-8")
+    with state.mic_control_send_lock:
+        try:
+            s.sendall(payload)
+        except OSError:
+            pass
+
+
+def daemon_mic_hold_change(state: AppState, delta: int) -> None:
+    """
+    Refcount holds sent to the daemon so the mic stays off for the whole command *and* for every
+    audio output (pocket-tts, WAV clips, SAPI), including clips that run outside handle_command.
+    """
+    if state.mic_control_socket is None or delta == 0:
+        return
+    with state.daemon_hold_lock:
+        prev = state.daemon_mic_hold_depth
+        state.daemon_mic_hold_depth = max(0, state.daemon_mic_hold_depth + delta)
+        cur = state.daemon_mic_hold_depth
+    if prev == 0 and cur > 0:
+        _notify_daemon_mic_busy(state, True)
+    elif prev > 0 and cur == 0:
+        _notify_daemon_mic_busy(state, False)
+
+
+def begin_voice_command(state: AppState) -> None:
+    with state.playback_lock:
+        state.command_busy_depth += 1
+    daemon_mic_hold_change(state, 1)
+
+
+def end_voice_command(state: AppState) -> None:
+    with state.playback_lock:
+        state.command_busy_depth = max(0, state.command_busy_depth - 1)
+    daemon_mic_hold_change(state, -1)
+
+
 def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console) -> None:
     cmd = normalize_text(cmd)
     cmd = expand_spoken_command(cmd)
@@ -921,11 +1025,15 @@ def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console
     if not cmd:
         return
 
-    push_voice_phase(state, console, "processing")
+    begin_voice_command(state)
     try:
-        _handle_command_body(state, speaker, cmd, console)
+        push_voice_phase(state, console, "processing")
+        try:
+            _handle_command_body(state, speaker, cmd, console)
+        finally:
+            pop_voice_phase(state, console)
     finally:
-        pop_voice_phase(state, console)
+        end_voice_command(state)
 
 
 def _handle_command_body(state: AppState, speaker: Speaker, cmd: str, console: Console) -> None:
@@ -1350,6 +1458,7 @@ def run_ui(connect: tuple[str, int] | None, *, visualize: bool = False) -> None:
             host, port = connect
             try:
                 s = socket.create_connection((host, port), timeout=10)
+                state.mic_control_socket = s
                 t = threading.Thread(target=socket_reader_loop, args=(s, speech_q, stop_evt), daemon=True)
                 t.start()
                 # If we were launched by the daemon on a "wake up" phrase, the wake phrase
