@@ -147,7 +147,7 @@ def shutil_which(cmd: str) -> str | None:
     return which(cmd)
 
 
-def open_kiosk_visualizer(url: str) -> None:
+def open_kiosk_visualizer(url: str) -> subprocess.Popen | None:
     if sys.platform == "win32":
         candidates = [
             os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
@@ -158,15 +158,15 @@ def open_kiosk_visualizer(url: str) -> None:
         ]
         for exe in candidates:
             if exe and os.path.isfile(exe):
-                subprocess.Popen(
+                return subprocess.Popen(
                     [exe, "--kiosk", url, "--new-window"],
                     close_fds=True,
                     cwd=os.path.expanduser("~"),
                 )
-                return
     import webbrowser
 
     webbrowser.open(url)
+    return None
 
 
 def feed_viz_from_pcm_int16(

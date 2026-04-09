@@ -441,6 +441,12 @@ def mic_utterances_to_queue(
                 utt = np.concatenate([utt, piece.astype(np.float32, copy=False)])
 
             if utt.size > max_samples:
+                # If we never detected voice above RMS threshold, this is almost certainly
+                # background noise. Transcribing it can produce hallucinations such as the
+                # Whisper initial_prompt leaking through.
+                if last_voice_t is None:
+                    utt = np.zeros((0,), dtype=np.float32)
+                    continue
                 to_send = utt.copy()
                 utt = np.zeros((0,), dtype=np.float32)
                 last_voice_t = None
@@ -467,6 +473,9 @@ def _enqueue_transcription(
     try:
         text = transcribe_utterance_audio(whisper, audio_f32, 16000)
         if not text:
+            return
+        # Guard: on near-silence, Whisper can emit the initial prompt itself.
+        if normalize_text(text) == normalize_text(os.environ.get("JARVIS_WHISPER_INITIAL_PROMPT", _WHISPER_INITIAL_PROMPT)):
             return
         if state is not None:
             with state.playback_lock:
@@ -1227,7 +1236,8 @@ def run_ui(connect: tuple[str, int] | None, *, visualize: bool = False) -> None:
             state.threejs_viz = viz
             setattr(state, "_viz_httpd", httpd)  # retain server for process lifetime
             vurl = f"http://127.0.0.1:{vport}/"
-            open_kiosk_visualizer(vurl)
+            viz_proc = open_kiosk_visualizer(vurl)
+            setattr(state, "_viz_proc", viz_proc)
             time.sleep(0.35)
             console.print(Text(f"Visualizer (audio from this run): {vurl}", style=f"bold {T_ACCENT}"))
             console.print(
@@ -1248,202 +1258,228 @@ def run_ui(connect: tuple[str, int] | None, *, visualize: bool = False) -> None:
             console.print(Text(f"[error] Visualizer failed to start: {e}", style=T_ERR))
             console.print()
 
-    if connect is None:
-        # Terminal is already "live": accept voice commands without a wake phrase until sleep.
-        state.voice_session_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
-        state.armed_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
-        state.local_mic_open_until_sleep = True
-
-    if connect is None:
-        ensure_whisper_warm(console)
-
-    speaker = Speaker(state)
-    speaker.status_console = console
-
-    def pocket_tts_warmup_background() -> None:
-        if not VOICE_TEMPLATE.is_file():
-            return
-
-        def run() -> None:
-            cache_dir = ROOT / ".cache"
-            cache_dir.mkdir(exist_ok=True)
-            outp = cache_dir / "_jarvis_pocket_warmup.wav"
-            try:
-                dev = os.environ.get("JARVIS_POCKET_DEVICE", "cpu").strip() or "cpu"
-                subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "pocket_tts",
-                        "generate",
-                        "-q",
-                        "--voice",
-                        str(VOICE_TEMPLATE),
-                        "--device",
-                        dev,
-                        "--text",
-                        "Ready.",
-                        "--output-path",
-                        str(outp),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    check=False,
-                )
-            except Exception:
-                pass
-
-        threading.Thread(target=run, daemon=True).start()
-
-    pocket_tts_warmup_background()
-
-    # Print immediately, play greeting async for seamless feel.
-    console.print(Text("Welcome, Sir.", style=f"bold {T_ACCENT}"))
-    console.print(Text("How may I assist you today?", style=T_TEXT))
-    if connect is None:
-        # Startup: only voices/wake.wav (no default SAPI — wrong voice / odd phrases). Opt-in: JARVIS_WAKE_SAPI=1.
-        if (VOICE_DIR / "wake.wav").is_file():
-            speaker.speak_key("wake", "", blocking=False)
-        elif os.environ.get("JARVIS_WAKE_SAPI", "").strip().lower() in ("1", "true", "yes"):
-            threading.Thread(
-                target=speaker._say_sapi,
-                args=("Welcome, sir. How may I assist you today.",),
-                daemon=True,
-            ).start()
-    console.print()
-    console.print(
-        Text(
-            "I can open websites, apps, type text, and answer questions via the local LLM.",
-            style=T_MUTED,
-        )
-    )
-    console.print(
-        Text(
-            "Say things like “launch notepad”, “google …”, or ask anything after wake.",
-            style=T_MUTED,
-        )
-    )
-    console.print(Text("Commands: clear, exit, test sound, sleep", style=T_MUTED))
-    console.print()
-
-    stop_evt = threading.Event()
-    speech_q: "queue.Queue[str]" = queue.Queue()
-
-    if connect is None:
-        speech_thread = threading.Thread(
-            target=speech_worker, args=(speech_q, stop_evt, state, console), daemon=True
-        )
-        speech_thread.start()
-    else:
-        host, port = connect
-        try:
-            s = socket.create_connection((host, port), timeout=10)
-            t = threading.Thread(target=socket_reader_loop, args=(s, speech_q, stop_evt), daemon=True)
-            t.start()
-            # If we were launched by the daemon on a "wake up" phrase, the wake phrase
-            # may have occurred before this UI connected. Auto-arm on connect.
-            now = time.time()
-            state.armed_until = now + ARM_SECONDS
-            state.voice_session_until = now + VOICE_SESSION_SECONDS
-            # Same clip as local startup (wake.wav), not confirm.wav.
-            speaker.speak_key("wake", "", blocking=False)
-        except Exception as e:
-            console.print(Text(f"[error] Failed to connect to daemon: {e}", style=T_ERR))
-            console.print(Text("Starting local microphone mode instead.", style=T_MUTED))
-            connect = None
+    try:
+        if connect is None:
+            # Terminal is already "live": accept voice commands without a wake phrase until sleep.
             state.voice_session_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
             state.armed_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
             state.local_mic_open_until_sleep = True
+
+        if connect is None:
             ensure_whisper_warm(console)
+
+        speaker = Speaker(state)
+        speaker.status_console = console
+
+        def pocket_tts_warmup_background() -> None:
+            if not VOICE_TEMPLATE.is_file():
+                return
+
+            def run() -> None:
+                cache_dir = ROOT / ".cache"
+                cache_dir.mkdir(exist_ok=True)
+                outp = cache_dir / "_jarvis_pocket_warmup.wav"
+                try:
+                    dev = os.environ.get("JARVIS_POCKET_DEVICE", "cpu").strip() or "cpu"
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "pocket_tts",
+                            "generate",
+                            "-q",
+                            "--voice",
+                            str(VOICE_TEMPLATE),
+                            "--device",
+                            dev,
+                            "--text",
+                            "Ready.",
+                            "--output-path",
+                            str(outp),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                    )
+                except Exception:
+                    pass
+
+            threading.Thread(target=run, daemon=True).start()
+
+        pocket_tts_warmup_background()
+
+        # Print immediately, play greeting async for seamless feel.
+        console.print(Text("Welcome, Sir.", style=f"bold {T_ACCENT}"))
+        console.print(Text("How may I assist you today?", style=T_TEXT))
+        if connect is None:
+            # Startup: only voices/wake.wav (no default SAPI — wrong voice / odd phrases). Opt-in: JARVIS_WAKE_SAPI=1.
+            if (VOICE_DIR / "wake.wav").is_file():
+                speaker.speak_key("wake", "", blocking=False)
+            elif os.environ.get("JARVIS_WAKE_SAPI", "").strip().lower() in ("1", "true", "yes"):
+                threading.Thread(
+                    target=speaker._say_sapi,
+                    args=("Welcome, sir. How may I assist you today.",),
+                    daemon=True,
+                ).start()
+        console.print()
+        console.print(
+            Text(
+                "I can open websites, apps, type text, and answer questions via the local LLM.",
+                style=T_MUTED,
+            )
+        )
+        console.print(
+            Text(
+                "Say things like “launch notepad”, “google …”, or ask anything after wake.",
+                style=T_MUTED,
+            )
+        )
+        console.print(Text("Commands: clear, exit, test sound, sleep", style=T_MUTED))
+        console.print()
+
+        stop_evt = threading.Event()
+        speech_q: "queue.Queue[str]" = queue.Queue()
+
+        if connect is None:
             speech_thread = threading.Thread(
                 target=speech_worker, args=(speech_q, stop_evt, state, console), daemon=True
             )
             speech_thread.start()
-    def speech_loop():
-        last_final: str = ""
-        last_final_at: float = 0.0
-
-        def normalize_phrase(s: str) -> str:
-            s = normalize_text(s)
-            # common Whisper artifacts for commands
-            s = re.sub(r"^(the|a)\s+", "", s).strip()
-            s = s.replace(" dot ", ".")
-            s = s.replace(" slash ", "/")
-            s = s.replace(" colon ", ":")
-            s = re.sub(r"\s+", " ", s).strip()
-            return s
-
-        def log_voice_turn(phrase: str) -> None:
-            print_chat_user(console, phrase, via="microphone")
-
-        while not stop_evt.is_set():
+        else:
+            host, port = connect
             try:
-                heard = speech_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            now = time.time()
-            phrase = (heard or "").strip()
-            if not phrase:
-                continue
-
-            phrase_norm = normalize_phrase(phrase)
-            if is_probably_non_speech_noise_transcript(phrase_norm):
-                continue
-            if phrase_norm == last_final and (now - last_final_at) < 1.2:
-                continue
-            last_final = phrase_norm
-            last_final_at = now
-
-            woke = contains_wake_phrase(phrase_norm)
-            in_session = now < state.voice_session_until
-            armed = state.local_mic_open_until_sleep or in_session or (now < state.armed_until)
-            if woke:
+                s = socket.create_connection((host, port), timeout=10)
+                t = threading.Thread(target=socket_reader_loop, args=(s, speech_q, stop_evt), daemon=True)
+                t.start()
+                # If we were launched by the daemon on a "wake up" phrase, the wake phrase
+                # may have occurred before this UI connected. Auto-arm on connect.
+                now = time.time()
                 state.armed_until = now + ARM_SECONDS
                 state.voice_session_until = now + VOICE_SESSION_SECONDS
-                cmd = strip_wake_phrase(phrase_norm)
-                if not cmd:
-                    speaker.speak_key("confirm", "Yes, sir?")
-                    refresh_terminal_prompt(console, state)
-                    continue
-            elif not armed:
-                continue
-            else:
-                cmd = phrase_norm
-
-            log_voice_turn(phrase)
-            try:
-                handle_command(state, speaker, cmd, console)
-                # successful command keeps the voice session alive
-                state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
-            except SystemExit:
-                stop_evt.set()
-                os._exit(0)
+                # Same clip as local startup (wake.wav), not confirm.wav.
+                speaker.speak_key("wake", "", blocking=False)
             except Exception as e:
-                state.last_error = str(e)
-                console.print(Text(f"[error] {e}", style=T_ERR))
-            finally:
-                refresh_terminal_prompt(console, state)
+                console.print(Text(f"[error] Failed to connect to daemon: {e}", style=T_ERR))
+                console.print(Text("Starting local microphone mode instead.", style=T_MUTED))
+                connect = None
+                state.voice_session_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
+                state.armed_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
+                state.local_mic_open_until_sleep = True
+                ensure_whisper_warm(console)
+                speech_thread = threading.Thread(
+                    target=speech_worker, args=(speech_q, stop_evt, state, console), daemon=True
+                )
+                speech_thread.start()
 
-    bg = threading.Thread(target=speech_loop, daemon=True)
-    bg.start()
+        def speech_loop():
+            last_final: str = ""
+            last_final_at: float = 0.0
 
-    try:
-        while True:
-            try:
-                print_prompt_block(console, state)
-                cmd = input()
-            except (EOFError, KeyboardInterrupt):
-                raise SystemExit(0)
-            cmd_stripped = (cmd or "").strip()
-            if cmd_stripped:
-                # Typed text already appeared on the JARVIS > line; skip duplicate YOU log.
-                console.print()
-            handle_command(state, speaker, cmd, console)
-    except SystemExit:
-        stop_evt.set()
-        sys.exit(0)
+            def normalize_phrase(s: str) -> str:
+                s = normalize_text(s)
+                # common Whisper artifacts for commands
+                s = re.sub(r"^(the|a)\s+", "", s).strip()
+                s = s.replace(" dot ", ".")
+                s = s.replace(" slash ", "/")
+                s = s.replace(" colon ", ":")
+                s = re.sub(r"\s+", " ", s).strip()
+                return s
+
+            def log_voice_turn(phrase: str) -> None:
+                print_chat_user(console, phrase, via="microphone")
+
+            while not stop_evt.is_set():
+                try:
+                    heard = speech_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                now = time.time()
+                phrase = (heard or "").strip()
+                if not phrase:
+                    continue
+
+                phrase_norm = normalize_phrase(phrase)
+                if is_probably_non_speech_noise_transcript(phrase_norm):
+                    continue
+                if phrase_norm == last_final and (now - last_final_at) < 1.2:
+                    continue
+                last_final = phrase_norm
+                last_final_at = now
+
+                woke = contains_wake_phrase(phrase_norm)
+                in_session = now < state.voice_session_until
+                armed = state.local_mic_open_until_sleep or in_session or (now < state.armed_until)
+                if woke:
+                    state.armed_until = now + ARM_SECONDS
+                    state.voice_session_until = now + VOICE_SESSION_SECONDS
+                    cmd = strip_wake_phrase(phrase_norm)
+                    if not cmd:
+                        speaker.speak_key("confirm", "Yes, sir?")
+                        refresh_terminal_prompt(console, state)
+                        continue
+                elif not armed:
+                    continue
+                else:
+                    cmd = phrase_norm
+
+                log_voice_turn(phrase)
+                try:
+                    handle_command(state, speaker, cmd, console)
+                    # successful command keeps the voice session alive
+                    state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
+                except SystemExit:
+                    stop_evt.set()
+                    os._exit(0)
+                except Exception as e:
+                    state.last_error = str(e)
+                    console.print(Text(f"[error] {e}", style=T_ERR))
+                finally:
+                    refresh_terminal_prompt(console, state)
+
+        bg = threading.Thread(target=speech_loop, daemon=True)
+        bg.start()
+
+        try:
+            while True:
+                try:
+                    print_prompt_block(console, state)
+                    cmd = input()
+                except (EOFError, KeyboardInterrupt):
+                    raise SystemExit(0)
+                cmd_stripped = (cmd or "").strip()
+                if cmd_stripped:
+                    # Typed text already appeared on the JARVIS > line; skip duplicate YOU log.
+                    console.print()
+                handle_command(state, speaker, cmd, console)
+        except SystemExit:
+            stop_evt.set()
+            sys.exit(0)
+    finally:
+        # Ensure kiosk visualizer closes when Jarvis exits.
+        try:
+            httpd = getattr(state, "_viz_httpd", None)
+            if httpd is not None:
+                try:
+                    httpd.shutdown()
+                except Exception:
+                    pass
+                try:
+                    httpd.server_close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            proc = getattr(state, "_viz_proc", None)
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def main() -> None:
