@@ -102,6 +102,8 @@ def launch_ui(port: int) -> subprocess.Popen | None:
         print(f"ERROR: Missing {jarvis_py}", file=sys.stderr)
         return None
     args = [str(py_exe), str(jarvis_py), "--connect", f"127.0.0.1:{port}"]
+    if os.environ.get("JARVIS_VISUALIZE", "").strip().lower() in ("1", "true", "yes"):
+        args.append("--visualize")
     kwargs: dict = {"cwd": str(ROOT)}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE

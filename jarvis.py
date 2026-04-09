@@ -24,6 +24,14 @@ from rich.text import Text
 import numpy as np
 from faster_whisper import WhisperModel
 
+from jarvis_threejs_viz import (
+    JarvisThreeJsVizState,
+    ensure_audiovisualizer_dist,
+    feed_viz_from_pcm_int16,
+    open_kiosk_visualizer,
+    start_viz_http_server,
+)
+
 APP_NAME = "J.A.R.V.I.S."
 PROMPT = "JARVIS > "  # bottom input line (matches status dock)
 
@@ -79,6 +87,7 @@ class AppState:
     # Drop mic transcripts while Jarvis is playing audio (stops TTS being re-heard as "commands").
     playback_depth: int = 0
     playback_lock: threading.Lock = field(default_factory=threading.Lock)
+    threejs_viz: JarvisThreeJsVizState | None = None
 
 
 def load_config() -> dict:
@@ -525,9 +534,19 @@ class Speaker:
         with self.state.playback_lock:
             self.state.playback_depth += 1
         try:
+            # Drive the visualizer in sync with playback: a single bulk FFT before stream.write()
+            # finishes in milliseconds while audio plays for seconds, so /api/viz decayed to ~0 mid-utterance.
+            pb_chunk = max(256, int(os.environ.get("JARVIS_VIZ_PLAYBACK_CHUNK", "1024")))
             with self._audio_lock:
                 stream = self._ensure_audio_stream(samplerate=samplerate, channels=ch)
-                stream.write(data.astype(np.int16, copy=False))
+                out = data.astype(np.int16, copy=False)
+                nfrm = int(out.shape[0])
+                for start in range(0, nfrm, pb_chunk):
+                    part = out[start : start + pb_chunk]
+                    if part.size == 0:
+                        break
+                    feed_viz_from_pcm_int16(self.state.threejs_viz, part, samplerate)
+                    stream.write(part)
         finally:
             with self.state.playback_lock:
                 self.state.playback_depth -= 1
@@ -681,6 +700,20 @@ def strip_wake_phrase(s: str) -> str:
         if re.match(pat, s_norm):
             return re.sub(pat, "", s_norm).strip()
     return s_norm
+
+
+def is_probably_non_speech_noise_transcript(s: str) -> bool:
+    """
+    Whisper sometimes emits short non-speech words from incidental sounds (mouse clicks, taps).
+    Filter those so they don't show up as user turns or trigger commands.
+    """
+    t = normalize_text(s).strip(" .,!?:;\"'`")
+    if not t:
+        return True
+    # Common "click" hallucinations from mouse / trackpad.
+    if re.fullmatch(r"(click|clique|tick|tock)(\s+(click|clique|tick|tock))*", t):
+        return True
+    return False
 
 
 def open_url(url: str) -> None:
@@ -1175,7 +1208,7 @@ def socket_reader_loop(sock: socket.socket, out_q: "queue.Queue[str]", stop_evt:
         return
 
 
-def run_ui(connect: tuple[str, int] | None) -> None:
+def run_ui(connect: tuple[str, int] | None, *, visualize: bool = False) -> None:
     configure_windows_utf8()
     # LLM output can contain "["; disable markup parsing. legacy_windows=False prefers UTF-8 VT output on Win10+.
     console = Console(markup=False, highlight=False, legacy_windows=False)
@@ -1186,6 +1219,35 @@ def run_ui(connect: tuple[str, int] | None) -> None:
     console.print()
 
     state = AppState()
+    if visualize:
+        try:
+            dist = ensure_audiovisualizer_dist(ROOT)
+            viz = JarvisThreeJsVizState()
+            httpd, vport = start_viz_http_server(viz, dist)
+            state.threejs_viz = viz
+            setattr(state, "_viz_httpd", httpd)  # retain server for process lifetime
+            vurl = f"http://127.0.0.1:{vport}/"
+            open_kiosk_visualizer(vurl)
+            time.sleep(0.35)
+            console.print(Text(f"Visualizer (audio from this run): {vurl}", style=f"bold {T_ACCENT}"))
+            console.print(
+                Text(
+                    "Use this kiosk window only — Parcel, file://, or an old tab will not get live audio (sphere stays smooth).",
+                    style=T_MUTED,
+                )
+            )
+            console.print(
+                Text(
+                    "Close the browser window or Alt+F4 to leave kiosk; Jarvis keeps running in this console.",
+                    style=T_MUTED,
+                )
+            )
+            console.print()
+        except Exception as e:
+            state.threejs_viz = None
+            console.print(Text(f"[error] Visualizer failed to start: {e}", style=T_ERR))
+            console.print()
+
     if connect is None:
         # Terminal is already "live": accept voice commands without a wake phrase until sleep.
         state.voice_session_until = _MIC_SESSION_ALWAYS_UNTIL_SLEEP
@@ -1327,6 +1389,8 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                 continue
 
             phrase_norm = normalize_phrase(phrase)
+            if is_probably_non_speech_noise_transcript(phrase_norm):
+                continue
             if phrase_norm == last_final and (now - last_final_at) < 1.2:
                 continue
             last_final = phrase_norm
@@ -1385,6 +1449,11 @@ def run_ui(connect: tuple[str, int] | None) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--connect", default="", help="Connect to daemon at host:port for speech input")
+    ap.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Open the Three.js fullscreen visualizer driven by Jarvis speech (PCM output).",
+    )
     args = ap.parse_args()
 
     connect = None
@@ -1392,13 +1461,17 @@ def main() -> None:
         host, port_s = args.connect.split(":", 1)
         connect = (host, int(port_s))
 
+    visualize = args.visualize or (
+        os.environ.get("JARVIS_VISUALIZE", "").strip().lower() in ("1", "true", "yes")
+    )
+
     # Migrate old root-level config if present
     old_cfg = ROOT / "jarvis_config.json"
     if old_cfg.exists() and not CONFIG_PATH.exists():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         old_cfg.replace(CONFIG_PATH)
 
-    run_ui(connect)
+    run_ui(connect, visualize=visualize)
 
 
 if __name__ == "__main__":
