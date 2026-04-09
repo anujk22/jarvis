@@ -907,6 +907,8 @@ def _split_tts_chunks(text: str, max_len: int = 380) -> list[str]:
 def handle_command(state: AppState, speaker: Speaker, cmd: str, console: Console) -> None:
     cmd = normalize_text(cmd)
     cmd = expand_spoken_command(cmd)
+    # Users often dictate commands with trailing punctuation (e.g. "exit.").
+    cmd = cmd.strip(" \t\r\n.,!?;:")
     if not cmd:
         return
 
