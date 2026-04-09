@@ -1110,7 +1110,6 @@ def _speak_with_pocket_tts_impl(
                 done.set()
 
             threading.Thread(target=gen_one, daemon=True).start()
-            speaker.play_thinking_clip(blocking=False)
             _under_thinking_status(console, lambda: done.wait(timeout=180))
             if ok_box[0] and out_path.is_file():
                 th = threading.Thread(target=lambda: speaker._play_wav(out_path), daemon=True)
@@ -1135,7 +1134,6 @@ def _speak_with_pocket_tts_impl(
                     q.put((i, None))
                     return
 
-        speaker.play_thinking_clip(blocking=False)
         threading.Thread(target=producer, daemon=True).start()
         _idx0, path0 = _under_thinking_status(console, lambda: q.get())
         if path0 is None:
