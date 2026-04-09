@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import queue
+import random
 import re
 import socket
 import os
@@ -24,7 +25,7 @@ import numpy as np
 from faster_whisper import WhisperModel
 
 APP_NAME = "J.A.R.V.I.S."
-PROMPT = "J.A.R.V.I.S. > "  # legacy; interactive loop uses styled prompt + input()
+PROMPT = "JARVIS > "  # bottom input line (matches status dock)
 
 # Theme: orange + off-white only (no blues / browns / reds)
 T_ACCENT = "#FFB84D"  # labels, active HUD, prompt, banner
@@ -50,8 +51,11 @@ _DEFAULT_LLM = ROOT / "models" / "llm" / "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 # Qwen2.x ChatML end-of-turn token (spell as concat so editors don't mangle it).
 _QWEN_IM_END = "<|" + "im_end" + "|>"
 
-# Longer buffers + small.en (or JARVIS_WHISPER=base.en|medium.en) help accuracy vs tiny chunks on tiny.en.
-_WHISPER_CHUNK_SEC = float(os.environ.get("JARVIS_WHISPER_CHUNK_SEC", "2.2"))
+# Mic → one Whisper run per utterance: buffer until this many seconds of quiet (RMS below threshold).
+_JARVIS_UTT_END_SILENCE_SEC = float(os.environ.get("JARVIS_UTT_END_SILENCE_SEC", "0.85"))
+_JARVIS_UTT_MIN_SEC = float(os.environ.get("JARVIS_UTT_MIN_SEC", "0.35"))
+_JARVIS_UTT_MAX_SEC = float(os.environ.get("JARVIS_UTT_MAX_SEC", "28.0"))
+_JARVIS_UTT_RMS = float(os.environ.get("JARVIS_UTT_RMS", "0.011"))
 # Do not put questions like "what time is it" here — Whisper repeats them on silence/noise (speaker→mic loop).
 _WHISPER_INITIAL_PROMPT = "English short voice commands: open notepad, launch app, search google, wake up jarvis."
 
@@ -188,15 +192,20 @@ def print_assistant_message(console: Console, message: str) -> None:
     _assistant_turn_separator(console)
 
 
-def print_assistant_thinking(console: Console) -> None:
-    """Shown while Pocket-TTS is generating; real reply prints after audio starts."""
-    ts = _chat_time()
-    line = Text()
-    line.append(f"{ts}  ", style=T_MUTED)
-    line.append("J.A.R.V.I.S.", style=f"bold {T_ACCENT}")
-    line.append("  ▶  ", style=T_MUTED)
-    line.append("Thinking…", style=T_MUTED)
-    console.print(line)
+def _under_thinking_status(console: Console | None, fn):
+    """
+    Animated status while Pocket-TTS generates (not a chat line). Label uses capital T.
+    """
+    if console is None:
+        return fn()
+    label = Text("Thinking", style=f"italic {T_MUTED}")
+    with console.status(
+        label,
+        spinner="dots12",
+        spinner_style=T_ACCENT,
+        speed=1.2,
+    ):
+        return fn()
 
 
 def voice_timeline_phase(state: AppState) -> str:
@@ -233,7 +242,7 @@ def pop_voice_phase(state: AppState, console: Console | None) -> None:
 
 
 def print_voice_status_line(console: Console, state: AppState, *, force: bool = False) -> None:
-    """Single-line phase indicator for the bottom dock (see print_prompt_block)."""
+    """Bottom dock: JARVIS + phase (listening / idle / …), not all-caps chips."""
     with state.ui_phase_lock:
         override = state.ui_phase_stack[-1] if state.ui_phase_stack else None
     base = voice_timeline_phase(state)
@@ -242,28 +251,41 @@ def print_voice_status_line(console: Console, state: AppState, *, force: bool = 
         return
     state._last_printed_hud_eff = eff
 
-    # One active row above the prompt, e.g. "◉ LISTENING..."
-    phase_rows: tuple[tuple[str, str, str], ...] = (
-        ("● ", "ARMED", "armed"),
-        ("◉ ", "LISTENING", "listening"),
-        ("◎ ", "PROCESSING", "processing"),
-        ("▶ ", "SPEAKING", "speaking"),
-    )
+    # (symbol, state word, optional dim hint)
+    specs: dict[str, tuple[str, str, str]] = {
+        "idle": ("◇", "idle", 'say “wake up” to arm'),
+        "armed": ("●", "armed", "say your command"),
+        "listening": ("◉", "listening", ""),
+        "processing": ("◎", "processing", ""),
+        "speaking": ("▶", "speaking", ""),
+    }
+    sym, word, hint = specs.get(eff, ("·", "ready", ""))
     line = Text()
-    sym, name, _ = next((r for r in phase_rows if r[2] == eff), ("· ", "IDLE", "idle"))
-    if eff == "idle" and not override:
-        line.append("· ", style=T_MUTED)
-        line.append("IDLE", style=T_MUTED)
-        line.append(" — ", style=T_MUTED)
-        line.append('say “wake up” to arm', style=f"italic {T_MUTED}")
-    else:
-        line.append(sym + name + "...", style=f"bold {T_ACCENT}")
+    line.append("── ", style=T_RULE)
+    line.append(f"{sym}  ", style=f"bold {T_ACCENT}")
+    line.append("JARVIS", style=f"bold {T_ACCENT}")
+    line.append("  ·  ", style=T_MUTED)
+    line.append(word, style=f"italic {T_MUTED}")
+    if hint:
+        line.append("  —  ", style=T_MUTED)
+        line.append(hint, style=T_MUTED)
+    line.append("  ──", style=T_RULE)
     console.print(line)
 
 
 def print_prompt_block(console: Console, state: AppState) -> None:
     """Bottom dock: phase line, then branded prompt (utmost bottom is the input cursor)."""
     print_voice_status_line(console, state)
+    console.print(Text(PROMPT.strip() + " ", style=f"bold {T_ACCENT}"), end="")
+
+
+def refresh_terminal_prompt(console: Console, state: AppState) -> None:
+    """
+    Redraw status + JARVIS > after the speech thread prints (main thread stays inside input()).
+    Without this, voice-only turns leave a blank tail with no visible prompt.
+    """
+    console.print()
+    print_voice_status_line(console, state, force=True)
     console.print(Text(PROMPT.strip() + " ", style=f"bold {T_ACCENT}"), end="")
 
 
@@ -333,14 +355,13 @@ def create_whisper_model() -> WhisperModel:
         return WhisperModel(wmodel, device="cpu", compute_type="int8")
 
 
-def transcribe_audio_chunk(model: WhisperModel, chunk: np.ndarray) -> str:
-    # VAD on by default: cuts silence hallucinations; JARVIS_WHISPER_VAD=0 to disable if short phrases get dropped.
-    use_vad = os.environ.get("JARVIS_WHISPER_VAD", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
+def transcribe_utterance_audio(
+    model: WhisperModel, audio: np.ndarray, samplerate: int = 16000
+) -> str:
+    """
+    Transcribe one full utterance. Whisper's own VAD is off so words at the end aren't dropped
+    inside a single clip (fixed short chunks + VAD were cutting sentences).
+    """
     prompt = os.environ.get("JARVIS_WHISPER_INITIAL_PROMPT", _WHISPER_INITIAL_PROMPT).strip()
     kw: dict = {
         "language": "en",
@@ -349,11 +370,104 @@ def transcribe_audio_chunk(model: WhisperModel, chunk: np.ndarray) -> str:
     }
     if prompt:
         kw["initial_prompt"] = prompt
-    if use_vad:
-        kw["vad_filter"] = True
-        kw["vad_parameters"] = {"min_silence_duration_ms": 250}
-    segments, _info = model.transcribe(chunk, **kw)
+    segments, _info = model.transcribe(audio, **kw)
     return " ".join(s.text.strip() for s in segments).strip()
+
+
+def mic_utterances_to_queue(
+    text_q: "queue.Queue[str]",
+    stop_evt: threading.Event,
+    whisper: WhisperModel,
+    *,
+    state: AppState | None,
+) -> None:
+    """
+    Read mic until the user pauses (~end silence), run Whisper once on the whole buffer, enqueue text.
+    Optional AppState for mic_level + skipping transcription during TTS playback (local UI only).
+    """
+    audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=64)
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            return
+        if stop_evt.is_set():
+            return
+        mono = indata[:, 0].copy()
+        if state is not None:
+            state.mic_level = float(np.max(np.abs(mono))) if mono.size else 0.0
+        try:
+            audio_q.put_nowait(mono)
+        except queue.Full:
+            pass
+
+    sr = 16000
+    end_silence = _JARVIS_UTT_END_SILENCE_SEC
+    min_sec = _JARVIS_UTT_MIN_SEC
+    max_sec = _JARVIS_UTT_MAX_SEC
+    rms_thresh = _JARVIS_UTT_RMS
+    min_samples = int(sr * min_sec)
+    max_samples = int(sr * max_sec)
+
+    utt = np.zeros((0,), dtype=np.float32)
+    last_voice_t: float | None = None
+
+    with sd.InputStream(
+        samplerate=sr,
+        dtype="float32",
+        channels=1,
+        callback=callback,
+        device=None,
+    ):
+        while not stop_evt.is_set():
+            try:
+                piece = audio_q.get(timeout=0.1)
+            except queue.Empty:
+                piece = None
+
+            now = time.time()
+            if piece is not None:
+                rms = float(np.sqrt(np.mean(np.square(piece))))
+                if rms >= rms_thresh:
+                    last_voice_t = now
+                utt = np.concatenate([utt, piece.astype(np.float32, copy=False)])
+
+            if utt.size > max_samples:
+                to_send = utt.copy()
+                utt = np.zeros((0,), dtype=np.float32)
+                last_voice_t = None
+                _enqueue_transcription(whisper, to_send, text_q, state)
+                continue
+
+            if (
+                utt.size >= min_samples
+                and last_voice_t is not None
+                and (now - last_voice_t) >= end_silence
+            ):
+                to_send = utt
+                utt = np.zeros((0,), dtype=np.float32)
+                last_voice_t = None
+                _enqueue_transcription(whisper, to_send, text_q, state)
+
+
+def _enqueue_transcription(
+    whisper: WhisperModel,
+    audio_f32: np.ndarray,
+    text_q: "queue.Queue[str]",
+    state: AppState | None,
+) -> None:
+    try:
+        text = transcribe_utterance_audio(whisper, audio_f32, 16000)
+        if not text:
+            return
+        if state is not None:
+            with state.playback_lock:
+                if state.playback_depth > 0:
+                    return
+        text_q.put(text)
+    except Exception as e:
+        if state is not None:
+            state.last_error = str(e)
+        time.sleep(0.05)
 
 
 class Speaker:
@@ -384,22 +498,35 @@ class Speaker:
                 channels=self._audio_channels,
                 dtype="int16",
                 blocksize=0,
+                latency="high",
             )
             self._audio_stream.start()
 
-            # Warmup: write a tiny bit of silence so the first real clip has no lag.
-            silence = np.zeros((int(self._audio_rate * 0.03), self._audio_channels), dtype=np.int16)
-            self._audio_stream.write(silence)
+            # Warmup: prime the device buffer so the first real clip is not clipped (Windows DAC often eats a few ms).
+            warm_s = float(os.environ.get("JARVIS_AUDIO_STREAM_WARMUP_SEC", "0.12"))
+            if warm_s > 0:
+                silence = np.zeros(
+                    (int(self._audio_rate * warm_s), self._audio_channels), dtype=np.int16
+                )
+                self._audio_stream.write(silence)
         return self._audio_stream
 
     def _play_pcm_int16(self, data: np.ndarray, samplerate: int) -> None:
         if data.ndim == 1:
             data = data.reshape(-1, 1)
+        ch = int(data.shape[1])
+        # Lead-in silence so the start of speech isn't cut off after stream open or clip changes (set JARVIS_AUDIO_LEAD_MS=0 to disable).
+        lead_ms = float(os.environ.get("JARVIS_AUDIO_LEAD_MS", "55"))
+        if lead_ms > 0:
+            n_lead = int(samplerate * (lead_ms / 1000.0))
+            if n_lead > 0:
+                pad = np.zeros((n_lead, ch), dtype=np.int16)
+                data = np.concatenate([pad, data.astype(np.int16, copy=False)], axis=0)
         with self.state.playback_lock:
             self.state.playback_depth += 1
         try:
             with self._audio_lock:
-                stream = self._ensure_audio_stream(samplerate=samplerate, channels=int(data.shape[1]))
+                stream = self._ensure_audio_stream(samplerate=samplerate, channels=ch)
                 stream.write(data.astype(np.int16, copy=False))
         finally:
             with self.state.playback_lock:
@@ -454,6 +581,13 @@ class Speaker:
                 self._say_sapi(fallback_text)
             else:
                 threading.Thread(target=self._say_sapi, args=(fallback_text,), daemon=True).start()
+
+    def play_thinking_clip(self, *, blocking: bool = False) -> None:
+        """Random thinking_1 / thinking_2 clip while Pocket-TTS is generating."""
+        opts = [k for k in ("thinking_1", "thinking_2") if (VOICE_DIR / f"{k}.wav").is_file()]
+        if not opts:
+            return
+        self.speak_key(random.choice(opts), "", blocking=blocking)
 
     def say(self, text: str) -> None:
         text = (text or "").strip()
@@ -931,8 +1065,6 @@ def _speak_with_pocket_tts_impl(
         if not chunks:
             return
 
-        delay = float(os.environ.get("JARVIS_TTS_TEXT_DELAY_SEC", "1"))
-
         if len(chunks) == 1:
             out_path = cache_dir / f"pocket_one_{time.time_ns() & 0xFFFFFFFF}.wav"
             done = threading.Event()
@@ -943,13 +1075,11 @@ def _speak_with_pocket_tts_impl(
                 done.set()
 
             threading.Thread(target=gen_one, daemon=True).start()
-            if console:
-                print_assistant_thinking(console)
-            done.wait(timeout=180)
+            speaker.play_thinking_clip(blocking=False)
+            _under_thinking_status(console, lambda: done.wait(timeout=180))
             if ok_box[0] and out_path.is_file():
                 th = threading.Thread(target=lambda: speaker._play_wav(out_path), daemon=True)
                 th.start()
-                time.sleep(delay)
                 if console:
                     print_assistant_message(console, text)
                 th.join(timeout=600)
@@ -970,10 +1100,9 @@ def _speak_with_pocket_tts_impl(
                     q.put((i, None))
                     return
 
-        if console:
-            print_assistant_thinking(console)
+        speaker.play_thinking_clip(blocking=False)
         threading.Thread(target=producer, daemon=True).start()
-        _idx0, path0 = q.get()
+        _idx0, path0 = _under_thinking_status(console, lambda: q.get())
         if path0 is None:
             if console:
                 print_assistant_message(console, text)
@@ -991,7 +1120,6 @@ def _speak_with_pocket_tts_impl(
 
         th = threading.Thread(target=play_sequential, daemon=True)
         th.start()
-        time.sleep(delay)
         if console:
             print_assistant_message(console, text)
         th.join(timeout=600)
@@ -1010,57 +1138,9 @@ def speech_worker(
     state: AppState,
     console: Console | None = None,
 ) -> None:
+    _ = console
     whisper = create_whisper_model()
-
-    audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
-
-    def callback(indata, frames, time_info, status):
-        if status:
-            return
-        if stop_evt.is_set():
-            return
-        mono = indata[:, 0].copy()
-        state.mic_level = float(np.max(np.abs(mono))) if mono.size else 0.0
-        try:
-            audio_q.put_nowait(mono)
-        except queue.Full:
-            pass
-
-    sr = 16000
-    chunk_seconds = _WHISPER_CHUNK_SEC
-    target_len = int(sr * chunk_seconds)
-    buf = np.zeros((0,), dtype=np.float32)
-
-    with sd.InputStream(
-        samplerate=sr,
-        dtype="float32",
-        channels=1,
-        callback=callback,
-        device=None,
-    ):
-        while not stop_evt.is_set():
-            try:
-                piece = audio_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            buf = np.concatenate([buf, piece])
-            if buf.shape[0] < target_len:
-                continue
-
-            chunk = buf[:target_len]
-            buf = buf[target_len:]
-
-            try:
-                text = transcribe_audio_chunk(whisper, chunk)
-                if text:
-                    with state.playback_lock:
-                        if state.playback_depth > 0:
-                            continue
-                    text_q.put(text)
-            except Exception as e:
-                state.last_error = str(e)
-                time.sleep(0.1)
+    mic_utterances_to_queue(text_q, stop_evt, whisper, state=state)
 
 
 def ensure_whisper_warm(console: Console) -> None:
@@ -1204,8 +1284,8 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             now = time.time()
             state.armed_until = now + ARM_SECONDS
             state.voice_session_until = now + VOICE_SESSION_SECONDS
-            # Daemon consumed the wake phrase before we connected; acknowledge with audio.
-            speaker.speak_key("confirm", "Yes, sir?", blocking=False)
+            # Same clip as local startup (wake.wav), not confirm.wav.
+            speaker.speak_key("wake", "", blocking=False)
         except Exception as e:
             console.print(Text(f"[error] Failed to connect to daemon: {e}", style=T_ERR))
             console.print(Text("Starting local microphone mode instead.", style=T_MUTED))
@@ -1219,21 +1299,8 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             )
             speech_thread.start()
     def speech_loop():
-        pending: list[str] = []
-        pending_started_at = 0.0
-        last_piece_at = 0.0
         last_final: str = ""
-        last_final_at = 0.0
-
-        def flush_pending() -> str:
-            nonlocal pending, pending_started_at, last_piece_at
-            if not pending:
-                return ""
-            phrase = " ".join(pending).strip()
-            pending = []
-            pending_started_at = 0.0
-            last_piece_at = 0.0
-            return phrase
+        last_final_at: float = 0.0
 
         def normalize_phrase(s: str) -> str:
             s = normalize_text(s)
@@ -1252,65 +1319,10 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             try:
                 heard = speech_q.get(timeout=0.2)
             except queue.Empty:
-                # if we have partials and there's been a pause, flush as one phrase
-                now = time.time()
-                if pending and (now - last_piece_at) > 0.65:
-                    phrase = flush_pending()
-                    if phrase:
-                        phrase_norm = normalize_phrase(phrase)
-                        # de-dupe rapid repeats
-                        if phrase_norm == last_final and (now - last_final_at) < 1.2:
-                            continue
-                        last_final = phrase_norm
-                        last_final_at = now
-                        now2 = time.time()
-                        woke2 = contains_wake_phrase(phrase_norm)
-                        in_session2 = now2 < state.voice_session_until
-                        armed2 = (
-                            state.local_mic_open_until_sleep
-                            or in_session2
-                            or (now2 < state.armed_until)
-                        )
-                        if woke2:
-                            state.armed_until = now2 + ARM_SECONDS
-                            state.voice_session_until = now2 + VOICE_SESSION_SECONDS
-                            cmd2 = strip_wake_phrase(phrase_norm)
-                            if not cmd2:
-                                speaker.speak_key("confirm", "Yes, sir?")
-                                continue
-                        elif not armed2:
-                            continue
-                        else:
-                            cmd2 = phrase_norm
-                        log_voice_turn(phrase)
-                        try:
-                            handle_command(state, speaker, cmd2, console)
-                            state.voice_session_until = time.time() + VOICE_SESSION_SECONDS
-                        except SystemExit:
-                            stop_evt.set()
-                            # Main thread may be blocked on input(); end the whole process.
-                            os._exit(0)
-                        except Exception as e:
-                            state.last_error = str(e)
-                            console.print(Text(f"[error] {e}", style=T_ERR))
                 continue
 
             now = time.time()
-            # accumulate pieces into a single phrase
-            piece = heard.strip()
-            if piece:
-                if not pending:
-                    pending_started_at = now
-                pending.append(piece)
-                last_piece_at = now
-
-            # safety: don't let a phrase run too long
-            if pending and (now - pending_started_at) > 2.5:
-                phrase = flush_pending()
-            else:
-                # wait for pause to flush
-                phrase = ""
-
+            phrase = (heard or "").strip()
             if not phrase:
                 continue
 
@@ -1329,6 +1341,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                 cmd = strip_wake_phrase(phrase_norm)
                 if not cmd:
                     speaker.speak_key("confirm", "Yes, sir?")
+                    refresh_terminal_prompt(console, state)
                     continue
             elif not armed:
                 continue
@@ -1346,6 +1359,8 @@ def run_ui(connect: tuple[str, int] | None) -> None:
             except Exception as e:
                 state.last_error = str(e)
                 console.print(Text(f"[error] {e}", style=T_ERR))
+            finally:
+                refresh_terminal_prompt(console, state)
 
     bg = threading.Thread(target=speech_loop, daemon=True)
     bg.start()
@@ -1359,7 +1374,7 @@ def run_ui(connect: tuple[str, int] | None) -> None:
                 raise SystemExit(0)
             cmd_stripped = (cmd or "").strip()
             if cmd_stripped:
-                # Typed text already appeared on the J.A.R.V.I.S. > line; skip duplicate YOU log.
+                # Typed text already appeared on the JARVIS > line; skip duplicate YOU log.
                 console.print()
             handle_command(state, speaker, cmd, console)
     except SystemExit:

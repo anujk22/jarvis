@@ -9,7 +9,7 @@ Local Jarvis-style assistant that:
 ## Setup (one time)
 
 ```powershell
-cd d:\Coding\Cursor\Jarvis
+cd <path-to-this-repo>
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -19,13 +19,13 @@ pip install -r requirements.txt
 
 ### Normal (terminal appears immediately)
 ```powershell
-cd d:\Coding\Cursor\Jarvis
+cd <path-to-this-repo>
 .\.venv\Scripts\python.exe .\jarvis.py
 ```
 
 ### Silent daemon (say “wake up” to pop the terminal)
 ```powershell
-cd d:\Coding\Cursor\Jarvis
+cd <path-to-this-repo>
 .\.venv\Scripts\pythonw.exe .\jarvis_daemon.py
 ```
 
@@ -38,7 +38,7 @@ This uses:
 One-time setup:
 
 ```powershell
-cd d:\Coding\Cursor\Jarvis
+cd <path-to-this-repo>
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 powershell -ExecutionPolicy Bypass -File .\scripts\setup_llm.ps1
 ```

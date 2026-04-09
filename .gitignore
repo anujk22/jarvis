@@ -1,12 +1,60 @@
 .venv/
+
 .cache/
+
 __pycache__/
+
 *.pyc
+
 config/
+
 models/vosk/
+
 models/piper/
+
 jarvis/
 
-# Large artifacts — install via scripts/setup_llm.ps1 (CI clones without these)
-models/llm/*
+
+
+# Large artifacts - install via scripts/setup_llm.ps1 (CI clones without these)
+
 bin/llama/
+
+
+
+# LLM / model weights (never commit)
+
+models/llm/
+
+models/whisper/
+
+models/**/*.safetensors
+
+models/**/*.bin
+
+models/**/*.onnx
+
+*.gguf
+
+*.gguf.part
+
+*.gguf.split
+
+
+
+# Voice-clone reference for Pocket-TTS (add locally)
+
+voices/template.wav
+
+
+
+# Common bulk / OS junk
+
+*.7z
+
+*.rar
+
+Thumbs.db
+
+.DS_Store
+

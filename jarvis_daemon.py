@@ -36,9 +36,6 @@ import subprocess
 import threading
 import time
 
-import numpy as np
-import sounddevice as sd
-
 try:
     import jarvis
 except ModuleNotFoundError as e:
@@ -153,49 +150,7 @@ def send_line(client_box: dict[str, socket.socket], text: str) -> None:
 
 def speech_loop(stop_evt: threading.Event, heard_q: "queue.Queue[str]") -> None:
     whisper = jarvis.create_whisper_model()
-
-    audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
-
-    def callback(indata, frames, time_info, status):
-        if status:
-            return
-        mono = indata[:, 0].copy()
-        try:
-            audio_q.put_nowait(mono)
-        except queue.Full:
-            pass
-
-    sr = 16000
-    chunk_seconds = jarvis._WHISPER_CHUNK_SEC
-    target_len = int(sr * chunk_seconds)
-    buf = np.zeros((0,), dtype=np.float32)
-
-    with sd.InputStream(
-        samplerate=sr,
-        dtype="float32",
-        channels=1,
-        callback=callback,
-        device=None,
-    ):
-        while not stop_evt.is_set():
-            try:
-                piece = audio_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            buf = np.concatenate([buf, piece])
-            if buf.shape[0] < target_len:
-                continue
-
-            chunk = buf[:target_len]
-            buf = buf[target_len:]
-
-            try:
-                text = jarvis.transcribe_audio_chunk(whisper, chunk)
-                if text:
-                    heard_q.put(text)
-            except Exception:
-                time.sleep(0.1)
+    jarvis.mic_utterances_to_queue(heard_q, stop_evt, whisper, state=None)
 
 
 def _acquire_singleton_lock() -> socket.socket:
