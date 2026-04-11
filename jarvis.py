@@ -142,7 +142,8 @@ def save_config(cfg: dict) -> None:
 
 def resolved_whisper_model_name() -> str:
     cfg = load_config()
-    return os.environ.get("JARVIS_WHISPER", cfg.get("whisper_model", "small.en")).strip() or "small.en"
+    # Default tiny.en matches README (CPU-friendly); override via config or JARVIS_WHISPER.
+    return os.environ.get("JARVIS_WHISPER", cfg.get("whisper_model", "tiny.en")).strip() or "tiny.en"
 
 
 def whisper_device_options() -> tuple[str, str]:
@@ -408,10 +409,12 @@ def transcribe_utterance_audio(
     inside a single clip (fixed short chunks + VAD were cutting sentences).
     """
     prompt = os.environ.get("JARVIS_WHISPER_INITIAL_PROMPT", _WHISPER_INITIAL_PROMPT).strip()
+    beam = int(os.environ.get("JARVIS_WHISPER_BEAM_SIZE", "1").strip() or "1")
+    beam = max(1, min(5, beam))
     kw: dict = {
         "language": "en",
         "task": "transcribe",
-        "beam_size": 5,
+        "beam_size": beam,
         "best_of": 1,
         "temperature": 0.0,
         "without_timestamps": True,
@@ -557,6 +560,40 @@ class Speaker:
         self._audio_rate = 24000  # common for many voice samples
         self._audio_channels = 1
 
+    @staticmethod
+    def _robotize_pcm_int16_chunk(
+        part: np.ndarray,
+        samplerate: int,
+        sample_offset: int,
+        *,
+        wet: float,
+        carrier_hz: float,
+        crush: float,
+    ) -> np.ndarray:
+        """
+        Cheap in-chunk DSP: ring-mod-style carrier + optional quantization. Runs in the playback
+        loop (no extra buffering), so it does not add perceptible latency beyond microseconds of CPU.
+        """
+        if wet <= 0.0 and crush <= 0.0:
+            return part
+        x = part.astype(np.float32, copy=False) * (1.0 / 32768.0)
+        n = int(x.shape[0])
+        if n == 0:
+            return part
+        t = (np.arange(n, dtype=np.float32) + float(sample_offset)) / float(samplerate)
+        c = np.sin((2.0 * np.pi * float(carrier_hz)) * t, dtype=np.float32)
+        c = c.reshape(-1, 1) if x.ndim == 2 else c
+        if wet > 0.0:
+            # Blend dry with ring-mod product; keeps speech more intelligible than 100% ring.
+            mod = x * c
+            x = (1.0 - wet) * x + wet * mod
+        if crush > 0.0:
+            # Quantize toward a small number of levels (mild "digital" edge when crush > 0).
+            g = max(8.0, 48.0 * (1.0 - crush) + 8.0 * crush)
+            x = np.round(x * g) / g
+        x = np.clip(x, -1.0, 1.0)
+        return (x * 32767.0).astype(np.int16)
+
     def _ensure_audio_stream(self, samplerate: int, channels: int) -> sd.OutputStream:
         # Keep one warm output stream to avoid "first play" lag.
         if self._audio_stream is None or self._audio_rate != samplerate or self._audio_channels != channels:
@@ -608,10 +645,22 @@ class Speaker:
                 stream = self._ensure_audio_stream(samplerate=samplerate, channels=ch)
                 out = data.astype(np.int16, copy=False)
                 nfrm = int(out.shape[0])
+                rob_wet = float(os.environ.get("JARVIS_VOICE_ROBOT", "0"))
+                rob_hz = float(os.environ.get("JARVIS_VOICE_ROBOT_HZ", "52"))
+                rob_crush = float(os.environ.get("JARVIS_VOICE_ROBOT_CRUSH", "0"))
                 for start in range(0, nfrm, pb_chunk):
                     part = out[start : start + pb_chunk]
                     if part.size == 0:
                         break
+                    if rob_wet > 0.0 or rob_crush > 0.0:
+                        part = self._robotize_pcm_int16_chunk(
+                            part,
+                            samplerate,
+                            start,
+                            wet=max(0.0, min(1.0, rob_wet)),
+                            carrier_hz=max(1.0, rob_hz),
+                            crush=max(0.0, min(1.0, rob_crush)),
+                        )
                     feed_viz_from_pcm_int16(self.state.threejs_viz, part, samplerate)
                     stream.write(part)
         finally:
